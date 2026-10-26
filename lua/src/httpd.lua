@@ -277,6 +277,54 @@ local function send_response(sock, status, status_text, headers, body, keep_aliv
   copas.send(sock, table.concat(lines, "\r\n"))
 end
 
+-- Streams a byte range of a file instead of a buffered body: a handler
+-- returns { __file = path, offset = n, length = n } as the body. Large
+-- media (multi-GB videos, downloads) used to be read whole into a Lua
+-- string, which crashed the process past LuaJIT's memory limit. Sent in
+-- 256KB pieces; copas.send yields while the socket is full, so other
+-- requests keep being served. Returns false if the client went away.
+local FILE_CHUNK_BYTES = 256 * 1024
+local function send_file_response(sock, status, status_text, headers, spec, keep_alive)
+  local f = io.open(spec.__file, "rb")
+  if not f then return nil end
+  local offset = spec.offset or 0
+  local length = spec.length or ((f:seek("end") or 0) - offset)
+  f:seek("set", offset)
+  headers["Content-Length"] = tostring(length)
+  if keep_alive then
+    headers["Connection"] = "keep-alive"
+    headers["Keep-Alive"] = "timeout=" .. KEEP_ALIVE_IDLE_SECONDS
+  else
+    headers["Connection"] = "close"
+  end
+  headers["Server"] = "SwarmPanel-Lua"
+  local lines = { string.format("HTTP/1.1 %d %s", status, status_text) }
+  for k, v in pairs(headers) do
+    lines[#lines + 1] = string.format("%s: %s", k, tostring(v))
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = ""
+  if not copas.send(sock, table.concat(lines, "\r\n")) then
+    f:close()
+    if spec.remove_after then os.remove(spec.__file) end
+    return false
+  end
+  local remaining = length
+  while remaining > 0 do
+    local piece = f:read(remaining < FILE_CHUNK_BYTES and remaining or FILE_CHUNK_BYTES)
+    if not piece or #piece == 0 then break end
+    if not copas.send(sock, piece) then
+      f:close()
+      if spec.remove_after then os.remove(spec.__file) end
+      return false
+    end
+    remaining = remaining - #piece
+  end
+  f:close()
+  if spec.remove_after then os.remove(spec.__file) end
+  return remaining == 0
+end
+
 -- HTTP/1.1 defaults to persistent connections unless the client sent
 -- "Connection: close"; HTTP/1.0 is the opposite (closes by default unless
 -- the client explicitly asked for "Connection: keep-alive"). version is the
@@ -586,6 +634,15 @@ local function serve_one_request(sock, start_time)
     status = status or 200
     for k, v in pairs(extra_headers or {}) do resp_headers[k] = v end
     resp_headers["Content-Type"] = resp_headers["Content-Type"] or "application/json"
+    if type(resp_body) == "table" and resp_body.__file then
+      log_status = status
+      local sent = send_file_response(sock, status, STATUS_TEXT[status] or "OK", resp_headers, resp_body, keep_alive)
+      if sent == nil then
+        respond(404, "Not Found", { ["Content-Type"] = "application/json" }, cjson.encode({ detail = "File is missing." }))
+        return keep_alive
+      end
+      return sent and keep_alive or false
+    end
     local body_out
     if type(resp_body) == "table" then
       body_out = cjson.encode(resp_body)

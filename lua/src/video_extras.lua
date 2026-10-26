@@ -138,15 +138,18 @@ end
 -- A `.pending` marker next to the output, exactly like ensure_hls_variant's:
 -- it is what stops every request during a long job from launching another
 -- copy of it, and a stale one (crashed job) is reclaimed on age.
+-- The create is atomic (shell noclobber): several worker processes serve
+-- the same video's requests, and a check-then-write let two of them start
+-- the same multi-minute ffmpeg job at once (seen live: two identical
+-- sprite jobs for one video saturating the CPU).
 local function claim_job(marker_path)
   local existing = file_mtime(marker_path)
   if existing and (os.time() - existing) < JOB_STALE_SECONDS then return false end
   os.execute("mkdir -p " .. shell_quote(marker_path:match("^(.*)/[^/]+$") or "."))
-  local handle = io.open(marker_path, "wb")
-  if not handle then return false end
-  handle:write(tostring(os.time()))
-  handle:close()
-  return true
+  if existing then os.remove(marker_path) end -- stale: a crashed job's leftover
+  local rc = os.execute(string.format("set -C; { printf %%s %s > %s ; } 2>/dev/null",
+    tostring(os.time()), shell_quote(marker_path)))
+  return rc == 0 or rc == true
 end
 
 -- ---------------------------------------------------------------------------
@@ -213,7 +216,9 @@ function M.ensure_sprite(media_id, item)
   local dir = sheet:match("^(.*)/[^/]+$")
   os.execute("mkdir -p " .. shell_quote(dir))
   local command = string.format(
-    "( nice -n 15 ionice -c2 -n6 %s -nostdin -v error -allowed_extensions ALL -i %s "
+    -- -skip_frame nokey: decode keyframes only (~5x faster); a tile per
+    -- several seconds doesn't need every frame decoded to pick from.
+    "( nice -n 15 ionice -c2 -n6 %s -nostdin -v error -allowed_extensions ALL -skip_frame nokey -i %s "
       .. "-vf %s -frames:v 1 -q:v 6 %s -y ; rm -f %s ) </dev/null >/dev/null 2>&1 &",
     ffmpeg_bin(),
     shell_quote(source),

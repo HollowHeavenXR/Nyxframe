@@ -9473,9 +9473,11 @@ function M.serve_media_thumb(req)
       -- is exactly that failure shape, just for a different job type.
       local slot_path = acquire_transcode_slot()
       if slot_path then
-        local content = resolve_media_bytes(item)
-        if content then
-          local src_path = original_bytes_cache_path(media_id, item)
+        -- Stored file directly (no whole-video read into memory); the
+        -- old resolve_media_bytes route only for a DB-stored original.
+        local src_path = M._image_source_path(item)
+        if not src_path and resolve_media_bytes(item) then src_path = original_bytes_cache_path(media_id, item) end
+        if src_path then
           local tmp_dst = cache_path .. ".tmp.webp"
           local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, width, 84, 0.35)
           os.execute(string.format(
@@ -9556,10 +9558,12 @@ local VIDEO_QUALITY_PROFILES = {
   ["480p"]  = { max_width = 854,  crf = 28, audio_bitrate = "192k", preset = "fast", profile = "high", vaapi_ceiling_bps = 2500000 },
   ["144p"]  = { max_width = 256,  crf = 36, audio_bitrate = "64k",  preset = "ultrafast", profile = "baseline", vaapi_ceiling_bps = 400000 },
 }
--- Raised 500MB -> 2GB (2026-10-26) to match the upload limit: it bounds GPU
--- re-encode time, and VAAPI encodes on this box are fast enough. The
--- in-memory ensure_video_quality_cache path keeps its own 500MB check.
-local VIDEO_TRANSCODE_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
+-- Raised 500MB -> 4GB (2026-10-26): it bounds GPU re-encode time, and
+-- VAAPI encodes on this box are fast enough (~4x realtime at 720p). Above
+-- the 2GB upload limit so an admin-raised one-off upload (a 3.6GB, 52-min
+-- recording) still gets its quality ladder. The in-memory
+-- ensure_video_quality_cache path keeps its own 500MB check.
+local VIDEO_TRANSCODE_SIZE_LIMIT = 4 * 1024 * 1024 * 1024
 
 local function ffprobe_bin()
   return os.getenv("GALLERY_FFPROBE_BIN") or "ffprobe"
@@ -12060,23 +12064,34 @@ local function serve_media_bytes_response(req, media_id, as_download, quality)
   -- cache file. Only fires on a warm cache -- a MISS still has to fetch
   -- the whole thing once via the existing path below (same cost as
   -- before), but every request after that hits this fast path instead.
-  if not as_download and item.media_kind == "video" and normalize_video_quality(quality) == "original" then
-    local fast_cache_path = item.id and original_bytes_cache_path(item.id, item)
-    local total = fast_cache_path and range_io.file_size(fast_cache_path)
-    if total then
-      local status, start_byte, end_byte, headers = range_io.parse(
-        req, total, item.mime_type, { ["Cache-Control"] = "public, max-age=86400" }
-      )
-      if status == 416 then
-        return 416, "", headers
+  -- Videos stream straight from the stored file (fast-disk tier, uploads
+  -- drive, or _original_cache -- see M._image_source_path), in any size,
+  -- via httpd's file-body responses. Previously a video without an
+  -- _original_cache copy was read whole into memory (and copied to the USB
+  -- drive) on its first view or any download -- a 3.6GB video crashed the
+  -- server. Also used for "lower quality" requests on videos too big for
+  -- the in-memory quality path below (which would load them whole first).
+  if item.media_kind == "video" then
+    local wants_original = normalize_video_quality(quality) == "original"
+    local too_big_for_memory = db.toint(item.file_size, 0) > 500 * 1024 * 1024
+    if as_download or wants_original or too_big_for_memory then
+      local path = M._image_source_path(item)
+      local total = path and range_io.file_size(path)
+      if total and total > 0 then
+        if as_download then
+          db.execute("UPDATE media_items SET downloads=downloads+1 WHERE id=%s", tostring(media_id))
+          return 200, { __file = path, offset = 0, length = total }, {
+            ["Content-Type"] = item.mime_type or "application/octet-stream",
+            ["Content-Disposition"] = "attachment; filename=\"" .. tostring(item.original_filename or "download"):gsub('"', "") .. "\"",
+            ["Cache-Control"] = "private, max-age=0, no-cache",
+          }
+        end
+        local status, start_byte, end_byte, headers = range_io.parse(
+          req, total, item.mime_type, { ["Cache-Control"] = "public, max-age=86400" }
+        )
+        if status == 416 then return 416, "", headers end
+        return status, { __file = path, offset = start_byte, length = end_byte - start_byte + 1 }, headers
       end
-      local slice = range_io.read_file_range(fast_cache_path, start_byte, end_byte)
-      if slice then
-        return status, slice, headers
-      end
-      -- Cache file vanished between the size check and the read (e.g. an
-      -- eviction mid-request) -- fall through to the normal path below
-      -- rather than 500ing.
     end
   end
 
@@ -12154,55 +12169,62 @@ end
 -- serve_media_bytes_response's own per-item visibility/downloads_enabled
 -- gating, just skipping rather than 403ing the whole batch over one
 -- inaccessible item.
+-- Returns the path of a finished zip (the caller streams it with
+-- remove_after) or nil. Each original is symlinked into a temp dir from
+-- where it is stored (zip follows symlinks) instead of being read into
+-- memory and rewritten, and stored without recompression (-0: images and
+-- videos are already compressed). The old version loaded every file and
+-- then the whole zip into Lua memory, so a few big videos crashed the
+-- server -- and `zip` wasn't installed in this container at all.
 local function build_media_zip(items, viewer_id)
   local tmp_dir = os.tmpname()
   os.remove(tmp_dir)
   os.execute("mkdir -p " .. zip_shell_quote(tmp_dir))
 
-  local file_paths = {}
+  local names = {}
   for _, item in ipairs(items) do
     local owner = viewer_id and tostring(item.user_id) == tostring(viewer_id)
     local visible = item.visibility ~= "private" or owner
     local allowed = db.tobool(item.downloads_enabled) or owner
     if visible and allowed then
-      local content = resolve_media_bytes(item)
-      if content then
-        local safe_base = tostring(item.original_filename or ("media-" .. item.id)):gsub("[/\\]", "_")
-        local path = tmp_dir .. "/" .. tostring(item.id) .. "-" .. safe_base
-        local f = io.open(path, "wb")
+      local safe_base = tostring(item.original_filename or ("media-" .. item.id)):gsub("[/\\]", "_")
+      local name = tostring(item.id) .. "-" .. safe_base
+      local path = tmp_dir .. "/" .. name
+      local src = M._image_source_path(item)
+      if src then
+        os.execute("ln -sf " .. zip_shell_quote(src) .. " " .. zip_shell_quote(path))
+        names[#names + 1] = name
+      else
+        local content = resolve_media_bytes(item)
+        local f = content and io.open(path, "wb")
         if f then
           f:write(content)
           f:close()
-          file_paths[#file_paths + 1] = path
+          names[#names + 1] = name
         end
       end
     end
   end
 
-  if #file_paths == 0 then
+  if #names == 0 then
     os.execute("rm -rf " .. zip_shell_quote(tmp_dir))
     return nil
   end
 
   local zip_path = tmp_dir .. ".zip"
-  local quoted_paths = {}
-  for _, p in ipairs(file_paths) do quoted_paths[#quoted_paths + 1] = zip_shell_quote(p) end
-  local cmd = "cd " .. zip_shell_quote(tmp_dir) .. " && zip -j -q " .. zip_shell_quote(zip_path)
-    .. " " .. table.concat(quoted_paths, " ") .. " </dev/null >/dev/null 2>&1"
-  local ok = os.execute(cmd)
-  local success = (ok == 0 or ok == true)
-
-  local zip_bytes = nil
-  if success then
-    local f = io.open(zip_path, "rb")
-    if f then
-      zip_bytes = f:read("*a")
-      f:close()
-    end
-  end
+  local quoted = {}
+  for _, n in ipairs(names) do quoted[#quoted + 1] = zip_shell_quote(n) end
+  local ok = os.execute("cd " .. zip_shell_quote(tmp_dir) .. " && nice -n 10 zip -0 -q " .. zip_shell_quote(zip_path)
+    .. " " .. table.concat(quoted, " ") .. " </dev/null >/dev/null 2>&1")
   os.execute("rm -rf " .. zip_shell_quote(tmp_dir))
-  os.remove(zip_path)
-  return zip_bytes
+  local f = io.open(zip_path, "rb")
+  local size = f and f:seek("end") or 0
+  if f then f:close() end
+  if not (ok == 0 or ok == true) or size == 0 then
+    os.remove(zip_path)
+    return nil
+  end
+  return zip_path
 end
 
 -- POST /api/media/download-batch -- confirmed live-404ing: StudioPage.jsx's
@@ -12233,9 +12255,9 @@ function M.download_media_batch(req)
     end
   end
 
-  local zip_bytes = build_media_zip(items, viewer_id)
-  if not zip_bytes then return 404, { detail = "None of the selected posts could be downloaded." } end
-  return 200, zip_bytes, {
+  local zip_path = build_media_zip(items, viewer_id)
+  if not zip_path then return 404, { detail = "None of the selected posts could be downloaded." } end
+  return 200, { __file = zip_path, remove_after = true }, {
     ["Content-Type"] = "application/zip",
     ["Content-Disposition"] = 'attachment; filename="gallery-selection.zip"',
   }
@@ -12256,13 +12278,13 @@ function M.download_collection(req)
   local items = type(body.media) == "table" and body.media or {}
   if #items == 0 then return 404, { detail = "This collection has no downloadable posts." } end
 
-  local zip_bytes = build_media_zip(items, viewer_id)
-  if not zip_bytes then return 404, { detail = "None of the posts in this collection could be downloaded." } end
+  local zip_path = build_media_zip(items, viewer_id)
+  if not zip_path then return 404, { detail = "None of the posts in this collection could be downloaded." } end
 
   local raw_name = tostring((body.collection and body.collection.name) or "collection")
   local safe_name = raw_name:gsub("[^%w%-_ ]", ""):gsub("%s+", "-"):sub(1, 60)
   if safe_name == "" then safe_name = "collection" end
-  return 200, zip_bytes, {
+  return 200, { __file = zip_path, remove_after = true }, {
     ["Content-Type"] = "application/zip",
     ["Content-Disposition"] = string.format('attachment; filename="%s.zip"', safe_name),
   }
