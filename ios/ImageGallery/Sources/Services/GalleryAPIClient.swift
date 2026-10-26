@@ -60,14 +60,33 @@ final class GalleryAPIClient {
 
     // MARK: Token
 
+    /// Every request reads the token (and `isAuthenticated` reads it again
+    /// for cache keys), and each read used to be a synchronous Keychain
+    /// query -- a slow IPC round trip, several per screen. The token is now
+    /// kept in memory once read. Only a found token is remembered: a miss
+    /// (signed out, or the Keychain still locked right after a reboot) is
+    /// re-checked next time, so a locked-Keychain miss can't stick.
+    private let tokenLock = NSLock()
+    private var cachedToken: String?
+
     var authToken: String? {
-        get { KeychainHelper.get(forKey: Self.tokenKeychainKey) }
+        get {
+            tokenLock.lock()
+            defer { tokenLock.unlock() }
+            if let cachedToken { return cachedToken }
+            let stored = KeychainHelper.get(forKey: Self.tokenKeychainKey)
+            cachedToken = stored
+            return stored
+        }
         set {
+            tokenLock.lock()
+            defer { tokenLock.unlock() }
             if let newValue {
                 KeychainHelper.set(newValue, forKey: Self.tokenKeychainKey)
             } else {
                 KeychainHelper.remove(forKey: Self.tokenKeychainKey)
             }
+            cachedToken = newValue
         }
     }
 

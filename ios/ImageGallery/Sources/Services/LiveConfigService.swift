@@ -11,7 +11,7 @@ final class LiveConfigService {
 
     private static let overrideKey = "gallery_backend_url_override"
     private static let cachedKey = "gallery_backend_url_cached"
-    private static let liveConfigURL = URL(string: "https://heavenlyxenusvr.github.io/Nyxframe/live-config.json")!
+    private static let liveConfigURL = URL(string: "https://hollowheavenxr.github.io/Nyxframe/live-config.json")!
 
     // The backend now sits behind a stable Cloudflare custom domain
     // (GALLERY_TUNNEL_PROVIDER=static in the server's .env), not a
@@ -51,6 +51,13 @@ final class LiveConfigService {
     }
 
     /// Best-known origin right now, without making a network call.
+    /// True once a backend address has been saved (or set manually), so
+    /// app launch can use it right away and refresh live-config in the
+    /// background instead of waiting on GitHub Pages first.
+    var hasKnownOrigin: Bool {
+        !manualOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !cachedOrigin.isEmpty
+    }
+
     var currentOrigin: String {
         let override = manualOverride.trimmingCharacters(in: .whitespacesAndNewlines)
         if !override.isEmpty { return normalizeOrigin(override) }

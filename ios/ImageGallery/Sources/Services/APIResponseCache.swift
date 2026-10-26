@@ -38,6 +38,12 @@ actor APIResponseCache {
             let data = try await task.value
             inFlight[key] = nil
             store[key] = Entry(data: data, expiresAt: Date().addingTimeInterval(ttl))
+            // Expired entries were never removed, so every page, search and
+            // profile ever fetched stayed in memory for the app's lifetime.
+            if store.count > 150 {
+                let now = Date()
+                store = store.filter { $0.value.expiresAt > now }
+            }
             return data
         } catch {
             inFlight[key] = nil

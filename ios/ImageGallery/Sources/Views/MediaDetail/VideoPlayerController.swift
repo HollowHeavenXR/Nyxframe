@@ -26,6 +26,8 @@ final class VideoPlayerController: ObservableObject {
     private var retryAttempt = 0
     private static let maxRetries = 2
     private var preflightTask: Task<Void, Never>?
+    /// Playlist URLs whose preflight returned 200 this app session.
+    private static var readyPlaylists = Set<URL>()
 
     /// Set (and playback restarted) whenever the quality selector picks a
     /// different rendition -- the URL, not the player, is the source of truth.
@@ -229,9 +231,18 @@ final class VideoPlayerController: ObservableObject {
         // time observed, matching the order of magnitude of the web
         // player's own retry budget (hls.js: 40 retries at up to 3s backoff
         // each, ~112s) rather than inventing a shorter one for iOS alone.
+        // A playlist that already answered 200 this session (replaying a
+        // video, coming back to it, switching back to a quality) is still
+        // there -- skip the extra round trip through the tunnel and start
+        // AVPlayer right away.
+        if Self.readyPlaylists.contains(preflightURL ?? url) {
+            attachPlayer(headers: headers, autoplay: autoplay)
+            return
+        }
         preflightTask = Task { [weak self] in
             guard let self else { return }
             let probeURL = preflightURL ?? url
+            var probeReady = false
             var request = URLRequest(url: probeURL)
             for (key, value) in headers { request.setValue(value, forHTTPHeaderField: key) }
 
@@ -266,13 +277,18 @@ final class VideoPlayerController: ObservableObject {
                     // variant playlist and handing it to AVPlayer would
                     // throw away the master (and with it the subtitles).
                     if probeURL == self.url { resolvedURL = http?.url }
+                    // Remember only a direct 200 (not a redirect to another
+                    // rendition because this one was busy).
+                    probeReady = status == 200 && (http?.url == nil || http?.url == probeURL)
                     break
                 } catch {
                     break // Let AVPlayer's own load surface the real error for anything else.
                 }
             }
             guard !Task.isCancelled else { return }
+            let markReady = probeReady
             await MainActor.run {
+                if markReady { Self.readyPlaylists.insert(probeURL) }
                 if let resolvedURL, resolvedURL != self.url {
                     self.url = resolvedURL
                 }

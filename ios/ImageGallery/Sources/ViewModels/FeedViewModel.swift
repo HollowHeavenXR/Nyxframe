@@ -48,8 +48,9 @@ final class FeedViewModel: ObservableObject {
     }
 
     func loadMoreIfNeeded(currentItem item: MediaItem) async {
-        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
-        guard index >= items.count - 6, !reachedEnd, !isLoadingMore else { return }
+        // Runs on every card appearance: check only the last six items
+        // instead of searching the whole (growing) list each time.
+        guard !reachedEnd, !isLoadingMore, items.suffix(6).contains(where: { $0.id == item.id }) else { return }
         let requestGeneration = generation
         let requestOffset = offset
         isLoadingMore = true
@@ -57,7 +58,10 @@ final class FeedViewModel: ObservableObject {
         do {
             let next = try await api.listMedia(mediaKind: mediaKind, categoryId: categoryId, subcategoryId: subcategoryId, query: query, sort: sort, adult: adult, limit: pageSize, offset: requestOffset)
             guard requestGeneration == generation else { return }
-            items.append(contentsOf: next)
+            // Offsets shift when posts are uploaded mid-scroll, so a page can
+            // repeat items already shown; duplicate ids break ForEach.
+            let known = Set(items.map(\.id))
+            items.append(contentsOf: next.filter { !known.contains($0.id) })
             offset += next.count
             reachedEnd = next.count < pageSize
             preloadThumbnails(for: next)
@@ -73,7 +77,7 @@ final class FeedViewModel: ObservableObject {
     /// (page 1's items are about to render immediately anyway), but called
     /// uniformly for both same as web does.
     private func preloadThumbnails(for page: [MediaItem]) {
-        let urls = page.prefix(6).compactMap { $0.thumbUrl.flatMap(URL.init(string:)) }
+        let urls = page.prefix(12).compactMap { $0.thumbUrl.flatMap(URL.init(string:)) }
         ImageCache.shared.preload(urls: urls)
     }
 }

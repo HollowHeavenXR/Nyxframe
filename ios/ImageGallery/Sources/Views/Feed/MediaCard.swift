@@ -79,7 +79,15 @@ struct MediaCard: View {
                         .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
                 )
                 .modifier(MediaBorderModifier(style: borderStyle, cornerRadius: cornerRadius))
-                .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 6)
+                // Shadow cast by a plain rounded rectangle behind the card,
+                // not by the whole composited card: a shadow on the card
+                // itself made Core Animation re-render the card offscreen
+                // on every scroll frame to find its outline.
+                .background(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.black)
+                        .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 6)
+                )
 
             if infoDisplay == .below || infoDisplay == .minimal {
                 footer(overlayStyle: false)
@@ -170,7 +178,10 @@ struct MediaCard: View {
         Image(systemName: systemImage)
             .font(.system(size: 10, weight: .bold))
             .frame(width: 24, height: 24)
-            .background(.ultraThinMaterial, in: Circle())
+            // Solid tint, not a material: a live blur per video card was
+            // re-sampled on every scroll frame (same fix as the website's
+            // glass pass).
+            .background(Color.black.opacity(0.5), in: Circle())
             .overlay(Circle().strokeBorder(Color.white.opacity(0.2), lineWidth: 1))
             .foregroundStyle(.white)
             .padding(8)

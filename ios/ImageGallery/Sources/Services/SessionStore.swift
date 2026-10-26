@@ -16,7 +16,16 @@ final class SessionStore: ObservableObject {
     /// already in the Keychain from a previous session, validate it against
     /// `/api/me` before showing the signed-in shell.
     func bootstrap() async {
-        await LiveConfigService.shared.refresh()
+        // Launch used to wait for live-config.json (a GitHub Pages round
+        // trip) before even starting /api/me. With an address already saved,
+        // start right away; the refresh runs alongside, and a request that
+        // fails because the address moved re-fetches it anyway
+        // (GalleryAPIClient.sendWithRetry).
+        if LiveConfigService.shared.hasKnownOrigin {
+            Task { await LiveConfigService.shared.refresh() }
+        } else {
+            await LiveConfigService.shared.refresh()
+        }
         if api.isAuthenticated {
             do {
                 // Bounded, not a bare `try await api.me()` -- see Timeout.swift's

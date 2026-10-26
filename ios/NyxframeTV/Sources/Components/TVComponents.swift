@@ -161,7 +161,10 @@ struct TVMediaThumbnail: View {
                 Image(systemName: "play.fill")
                     .font(.caption.bold())
                     .padding(10)
-                    .background(.ultraThinMaterial, in: Circle())
+                    // Solid tint instead of a material: a live blur per card
+                    // is costly on Apple TV HD, especially during the focus
+                    // lift animation.
+                    .background(Color.black.opacity(0.55), in: Circle())
                     .padding(12)
             }
         }

@@ -522,7 +522,7 @@ enum ProfileLinks {
     /// same profile there for anyone without the app installed.
     static func shareURL(username: String) -> URL {
         let encoded = username.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? username
-        return URL(string: "https://heavenlyxenusvr.github.io/Nyxframe/users/\(encoded)")
-            ?? URL(string: "https://heavenlyxenusvr.github.io/Nyxframe/")!
+        return URL(string: "https://hollowheavenxr.github.io/Nyxframe/users/\(encoded)")
+            ?? URL(string: "https://hollowheavenxr.github.io/Nyxframe/")!
     }
 }
