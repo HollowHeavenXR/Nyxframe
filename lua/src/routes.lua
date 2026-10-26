@@ -4567,6 +4567,39 @@ function M.start_hot_tier_mover()
   end)
 end
 
+-- io.popen look-alike (lines/read/close) that runs `cmd` through
+-- os.execute into a temp file instead, so blockwatch runs it in the
+-- background and the calling copas thread yields until it finishes. For
+-- directory scans (find/du) over the USB drive, which block for seconds.
+function M._popen_async(cmd)
+  local out = os.tmpname()
+  os.execute(cmd .. " > " .. shell_quote(out))
+  local f = io.open(out, "rb")
+  local text = f and f:read("*a") or ""
+  if f then f:close() end
+  os.remove(out)
+  local pos = 1
+  local handle = {}
+  local function next_line()
+    if pos > #text then return nil end
+    local e = text:find("\n", pos, true)
+    local line = text:sub(pos, (e or (#text + 1)) - 1)
+    pos = (e or #text) + 1
+    return line
+  end
+  function handle:lines() return next_line end
+  function handle:read(fmt)
+    if fmt == "*a" or fmt == "a" then
+      local rest = text:sub(pos)
+      pos = #text + 1
+      return rest
+    end
+    return next_line()
+  end
+  function handle:close() return true end
+  return handle
+end
+
 -- "2 GB" / "700 MB" for limit messages.
 function M._upload_limit_label()
   local bytes = M.settings.max_upload_bytes
@@ -8168,7 +8201,7 @@ local function walk_cache_dir(uploads_dir, referenced_ids)
   local now = os.time()
   for _, dir_name in ipairs(ORPHAN_CACHE_DIR_NAMES) do
     local cache_dir = uploads_dir .. "/" .. dir_name
-    local handle = io.popen(string.format("find %s -type f -printf '%%s %%T@ %%p\\n' 2>/dev/null", shell_quote(cache_dir)))
+    local handle = M._popen_async(string.format("find %s -type f -printf '%%s %%T@ %%p\\n' 2>/dev/null", shell_quote(cache_dir)))
     if handle then
       for line in handle:lines() do
         local size_str, mtime_str, path = line:match("^(%d+) (%S+) (.+)$")
@@ -9523,7 +9556,10 @@ local VIDEO_QUALITY_PROFILES = {
   ["480p"]  = { max_width = 854,  crf = 28, audio_bitrate = "192k", preset = "fast", profile = "high", vaapi_ceiling_bps = 2500000 },
   ["144p"]  = { max_width = 256,  crf = 36, audio_bitrate = "64k",  preset = "ultrafast", profile = "baseline", vaapi_ceiling_bps = 400000 },
 }
-local VIDEO_TRANSCODE_SIZE_LIMIT = 500 * 1024 * 1024
+-- Raised 500MB -> 2GB (2026-10-26) to match the upload limit: it bounds GPU
+-- re-encode time, and VAAPI encodes on this box are fast enough. The
+-- in-memory ensure_video_quality_cache path keeps its own 500MB check.
+local VIDEO_TRANSCODE_SIZE_LIMIT = 2 * 1024 * 1024 * 1024
 
 local function ffprobe_bin()
   return os.getenv("GALLERY_FFPROBE_BIN") or "ffprobe"
@@ -9983,7 +10019,7 @@ local function ensure_video_quality_cache(media_id, item, content, quality)
 
   local profile = VIDEO_QUALITY_PROFILES[quality]
   if not profile then return nil end
-  if #content > VIDEO_TRANSCODE_SIZE_LIMIT then return nil end
+  if #content > 500 * 1024 * 1024 then return nil end -- whole video in memory here
   -- Every call here is a real re-encode (there's no -c copy option at this
   -- level -- callers only reach this for quality ~= "original"), so this
   -- is GPU-or-nothing unconditionally, checked before even looking at the
@@ -10056,9 +10092,10 @@ local function ensure_video_quality_cache(media_id, item, content, quality)
     -- force_key_frames here: this produces a plain .mp4 (no HLS
     -- segmenting), so there's no segment-boundary alignment to fix.
     local codec_args = string.format(
-      "-vf %s,format=nv12,hwupload -c:v h264_vaapi -rc_mode QVBR -global_quality %d -b:v %d -maxrate %d "
+      "-vf %s,format=nv12,hwupload -c:v h264_vaapi -rc_mode VBR -b:v %d -maxrate %d -bufsize %d "
         .. "-profile:v %s -level 4.1 -c:a aac -b:a %s",
-      shell_quote(scale_filter), profile.crf, profile.vaapi_ceiling_bps, profile.vaapi_ceiling_bps,
+      shell_quote(scale_filter), math.floor(profile.vaapi_ceiling_bps * 0.7), profile.vaapi_ceiling_bps,
+      profile.vaapi_ceiling_bps * 2,
       vaapi_profile, profile.audio_bitrate
     )
 
@@ -10677,12 +10714,16 @@ local function ensure_hls_variant(media_id, item, content_fn, quality, opts)
     -- verification notes) on the "original"-quality VBR branch above --
     -- same VFR-source uneven-segment issue applies here too, and this QVBR
     -- branch is the one that actually runs for every scaled quality tier.
+    -- VBR, not QVBR: this box's radeonsi driver (Mesa 24, Radeon 610M)
+    -- only offers CQP/CBR/VBR and h264_vaapi fails to open with QVBR -- every
+    -- encode died instantly, leaving an empty dir. Aims at ~70% of the
+    -- quality's ceiling and never exceeds it.
     codec_args = string.format(
-      "%s -force_key_frames %s -c:v h264_vaapi -rc_mode QVBR -global_quality %d -b:v %d -maxrate %d "
+      "%s -force_key_frames %s -c:v h264_vaapi -rc_mode VBR -b:v %d -maxrate %d -bufsize %d "
         .. "-profile:v %s -level 4.1 -c:a aac -b:a %s",
       scale_filter and ("-vf " .. shell_quote(scale_filter .. ",format=nv12,hwupload")) or "",
       shell_quote(string.format("expr:gte(t,n_forced*%d)", HLS_SEGMENT_SECONDS)),
-      profile.crf, ceiling_bps, ceiling_bps,
+      math.floor(ceiling_bps * 0.7), ceiling_bps, ceiling_bps * 2,
       vaapi_profile, profile.audio_bitrate
     )
   end
@@ -10839,7 +10880,7 @@ local WARM_SCAN_PAUSE_SECONDS = 1.0   -- between cheap existence-checks (no laun
 -- implementation, and minute granularity is plenty for "is anyone watching."
 transcode.warmer.someone_is_watching = function()
   local minutes = math.max(1, math.ceil(transcode.warmer.watch_idle_seconds / 60))
-  local handle = io.popen(string.format(
+  local handle = M._popen_async(string.format(
     "find %s -maxdepth 2 -name .last_watched -mmin -%d -print -quit 2>/dev/null",
     shell_quote(M.settings.uploads_dir .. "/_hls_cache"), minutes))
   if not handle then return false end
@@ -11294,7 +11335,7 @@ function M.start_stale_transcode_cleanup()
     -- waiting for one that may never come.
     local hls_dir = M.settings.uploads_dir .. "/_hls_cache"
     local now = os.time()
-    local handle = io.popen(string.format(
+    local handle = M._popen_async(string.format(
       "find %s -maxdepth 1 -type f -name '*.pending' -printf '%%T@ %%p\\n' 2>/dev/null",
       shell_quote(hls_dir)
     ))
@@ -11304,7 +11345,7 @@ function M.start_stale_transcode_cleanup()
         local mtime = tonumber(mtime_str)
         local variant_dir = marker_path and marker_path:match("^(.*)%.pending$")
         if mtime and variant_dir and (now - mtime) > MIN_AGE_SECONDS and not hls_variant_ready(variant_dir) then
-          local du = io.popen(string.format("du -sb %s 2>/dev/null", shell_quote(variant_dir)))
+          local du = M._popen_async(string.format("du -sb %s 2>/dev/null", shell_quote(variant_dir)))
           local dir_bytes = 0
           if du then
             local dline = du:read("*l")
@@ -11437,15 +11478,33 @@ function M.start_hls_idle_reaper()
       for d in text:gmatch("#EXTINF:([%d%.]+)") do done = done + (tonumber(d) or 0) end
       return done >= expected * 0.8
     end
-    local handle = io.popen(string.format("find %s -mindepth 1 -maxdepth 1 -type d 2>/dev/null", shell_quote(hls_dir)))
-    if not handle then return reaped end
-    for dir in handle:lines() do
+    -- 2026-10-26: _hls_cache is on the slow USB drive with ~280 variant
+    -- dirs; opening files in every one of them (hls_variant_ready etc.)
+    -- without yielding held the primary worker for up to 96s per sweep.
+    -- Now: only dirs that have a .pid (listed by a background `find`),
+    -- and only those whose ffmpeg is actually alive (/proc, in memory)
+    -- get any further checks; the loop yields between dirs.
+    local list_path = os.tmpname()
+    os.execute(string.format("find %s -mindepth 2 -maxdepth 2 -name .pid > %s 2>/dev/null",
+      shell_quote(hls_dir), shell_quote(list_path)))
+    local candidates = {}
+    local lf = io.open(list_path, "rb")
+    if lf then
+      for line in lf:lines() do candidates[#candidates + 1] = line:sub(1, -6) end
+      lf:close()
+    end
+    os.remove(list_path)
+    for _, dir in ipairs(candidates) do
+      copas.sleep(0)
+      local pf = io.open(dir .. "/.pid", "rb")
+      local pid = pf and tonumber(pf:read("*a")) or nil
+      if pf then pf:close() end
+      local live_cf = pid and io.open("/proc/" .. tostring(pid) .. "/cmdline", "rb")
+      local live = live_cf and (live_cf:read("*a") or ""):find("ffmpeg", 1, true) ~= nil
+      if live_cf then live_cf:close() end
       -- hls_variant_ready (has #EXT-X-ENDLIST) means the encode already
       -- finished on its own -- nothing to reap regardless of heartbeat age.
-      if not hls_variant_ready(dir) then
-        local pf = io.open(dir .. "/.pid", "rb")
-        local pid = pf and tonumber(pf:read("*a")) or nil
-        if pf then pf:close() end
+      if live and not hls_variant_ready(dir) then
         local hb = io.open(dir .. "/.last_watched", "rb")
         local last_watched = hb and tonumber(hb:read("*a")) or nil
         if hb then hb:close() end
@@ -11500,7 +11559,6 @@ function M.start_hls_idle_reaper()
         end
       end
     end
-    handle:close()
     return reaped
   end
 
@@ -12762,7 +12820,7 @@ function M.start_cache_orphan_sweep()
         if purgeable then
           local size = 0
           if is_dir then
-            local du = io.popen(string.format("du -sb %s 2>/dev/null", shell_quote(path)))
+            local du = M._popen_async(string.format("du -sb %s 2>/dev/null", shell_quote(path)))
             if du then
               size = tonumber((du:read("*l") or ""):match("^(%d+)")) or 0
               du:close()
