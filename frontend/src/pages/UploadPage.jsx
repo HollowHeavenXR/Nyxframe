@@ -1,15 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Clipboard, FileImage, FileVideo, RefreshCw, Trash2, Upload, WandSparkles } from "lucide-react";
+import { Clipboard, FileImage, FileVideo, RefreshCw, Trash2, Upload, WandSparkles, X } from "lucide-react";
 import { apiFetch, clearApiCache, postClientDiagnostic, readToken, resolveApiUrl } from "../api.js";
 import { MAX_UPLOAD_BYTES } from "../config.js";
-import { addPendingUploadJob } from "../uploadJobs.js";
+import { addPendingUploadJob, describeUploadStage } from "../uploadJobs.js";
 import { ChipRow, Page, RequireLogin, Segmented } from "../components/ui.jsx";
 import { formatBytes } from "../utils/format.js";
 
 const SUBCATEGORY_SLOT_COUNT = 20;
 const EDGE_SAFE_UPLOAD_BYTES = 80 * 1024 * 1024;
-const DEFAULT_CHUNK_BYTES = 20 * 1024 * 1024;
+// At or under this, a file goes up as one request (with defer=true, so the
+// server hands it to a background job instead of processing while we
+// wait). Above it, it goes up in pieces, several at once, each retried on
+// its own -- a dropped connection near the end of a big video then costs
+// one piece, not the whole file.
+const SINGLE_REQUEST_MAX_BYTES = 16 * 1024 * 1024;
+const PARALLEL_CHUNK_BYTES = 8 * 1024 * 1024;
+const PARALLEL_CHUNK_STREAMS = 4;
+const MAX_REQUEST_ATTEMPTS = 5;
+// How long the upload page itself follows processing before handing the
+// job to Shell's background poller and moving on.
+const FOLLOW_PROCESSING_MS = 45_000;
 // Uniform ceiling for every upload-related request (init/chunk/finish/direct
 // <=80MB/analyze) -- finalize_upload does real synchronous work server-side
 // (fast-start remux, full-file sha256, up to a 30s AI vision call, disk
@@ -126,9 +137,28 @@ function normalizeSlots(values) {
   return slots.map((value) => String(value || ""));
 }
 
-function xhrJson(url, { method = "POST", body, contentType, onProgress, timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
+function uploadError(message, { status = 0, retryable = false, payload = null } = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.retryable = retryable;
+  error.payload = payload;
+  return error;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Network errors, timeouts, rate limits and 5xx (including Cloudflare's
+// 520-524 when the origin restarts or is briefly busy) are worth another
+// try; any other 4xx is a real rejection.
+function isRetryableStatus(status) {
+  return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+// `track` registers the in-flight request so Cancel can abort it.
+function xhrJson(url, { method = "POST", body, contentType, onProgress, timeoutMs = UPLOAD_TIMEOUT_MS, track } = {}) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    track?.(xhr);
     const token = readToken();
     xhr.open(method, url, true);
     if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
@@ -142,13 +172,31 @@ function xhrJson(url, { method = "POST", body, contentType, onProgress, timeoutM
       try { payload = xhr.responseText ? JSON.parse(xhr.responseText) : null; } catch { /* handled below */ }
       if (xhr.status >= 200 && xhr.status < 300) return resolve(payload);
       const detail = payload?.detail;
-      reject(new Error(detail ? (Array.isArray(detail) ? detail.map((item) => item?.msg || item).join("; ") : String(detail)) : `Upload failed (${xhr.status})`));
+      reject(uploadError(
+        detail ? (Array.isArray(detail) ? detail.map((item) => item?.msg || item).join("; ") : String(detail)) : `Upload failed (${xhr.status})`,
+        { status: xhr.status, retryable: isRetryableStatus(xhr.status), payload },
+      ));
     });
-    xhr.addEventListener("error", () => reject(new Error("Network error during upload.")));
-    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled.")));
-    xhr.addEventListener("timeout", () => reject(new Error("Request timed out. Please try again.")));
+    xhr.addEventListener("error", () => reject(uploadError("Network error during upload.", { retryable: true })));
+    xhr.addEventListener("abort", () => reject(uploadError("Upload cancelled.", { status: -1 })));
+    xhr.addEventListener("timeout", () => reject(uploadError("Request timed out. Please try again.", { retryable: true })));
     xhr.send(body);
   });
+}
+
+// Retries a request with backoff (1s, 2s, 4s, 8s) while it fails in a
+// retryable way. `onRetry` counts attempts for diagnostics.
+async function withRetries(run, { isCancelled, onRetry } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await run(attempt);
+    } catch (error) {
+      if (isCancelled?.() || !error.retryable || attempt >= MAX_REQUEST_ATTEMPTS) throw error;
+      onRetry?.();
+      await sleep(Math.min(8000, 1000 * 2 ** (attempt - 1)));
+      if (isCancelled?.()) throw uploadError("Upload cancelled.", { status: -1 });
+    }
+  }
 }
 
 export function UploadPage({ ctx }) {
@@ -190,6 +238,36 @@ export function UploadPage({ ctx }) {
   const [extraFiles, setExtraFiles] = useState([]); // [{ id, file, status: pending|uploading|done|error, error }]
   const extraFileIdRef = useRef(0);
   const prefillRef = useRef(null); // uncontrolled -- "Prefill from post" input, read on click only
+  // idle -> uploading (bytes going up) -> processing (server working on a
+  // single upload this page is following) -> idle/navigated away.
+  const [phase, setPhase] = useState("idle");
+  const [stage, setStage] = useState("");
+  const [rate, setRate] = useState(null); // { bps, etaSeconds } while uploading
+  const activeXhrs = useRef(new Set());
+  const cancelledRef = useRef(false);
+  const followJobRef = useRef(null); // { jobId, filename } being followed here
+
+  // Warn before closing the tab while bytes are still going up (once
+  // they're sent, processing carries on server-side regardless).
+  useEffect(() => {
+    if (phase !== "uploading") return undefined;
+    const onBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [phase]);
+
+  // Leaving the page while following a job: hand it to Shell's poller so
+  // its completion toast still shows up wherever the user goes.
+  useEffect(() => () => {
+    const job = followJobRef.current;
+    if (job) {
+      followJobRef.current = null;
+      addPendingUploadJob(job);
+    }
+  }, []);
 
   useEffect(() => {
     setMediaInfo(null);
@@ -223,6 +301,17 @@ export function UploadPage({ ctx }) {
   });
 
   if (!ctx.user) return <RequireLogin />;
+
+  function trackXhr(xhr) {
+    activeXhrs.current.add(xhr);
+    xhr.addEventListener("loadend", () => activeXhrs.current.delete(xhr));
+  }
+
+  function cancelUpload() {
+    cancelledRef.current = true;
+    for (const xhr of activeXhrs.current) xhr.abort();
+    activeXhrs.current.clear();
+  }
 
   function pickFile(file) {
     if (!file) return;
@@ -375,107 +464,231 @@ export function UploadPage({ ctx }) {
     }
   }
 
-  // Core of the old submit(): upload exactly one `file` with the given
-  // title/description plus every OTHER field shared off `form`
-  // (category/tags/visibility/toggles/publish_at/source_url). Extracted
-  // so the batch queue below can call this once per queued file instead
-  // of duplicating the direct-vs-chunked branching a second time. Returns
-  // the parsed response; throws on failure -- callers decide what to do
-  // with either, same contract xhrJson/apiFetch already have.
-  async function uploadOneFile(file, { title, description }, onProgress) {
+  // Form fields shared by every file of this submit (title/description
+  // are per file: the batch rows leave them blank for AI auto-fill).
+  function uploadFields({ title, description }) {
+    const placement = resolvePlacement(ctx.lookups.categories, form.category, form.subcategories);
+    const fields = [
+      ["title", title],
+      ["description", description],
+      ["category_id", placement.categoryId],
+      ["category_name", placement.categoryName],
+      ["subcategory_id", placement.subcategoryIds[0] || ""],
+      ["subcategory_name", placement.subcategoryNames[0] || ""],
+      ["subcategory_ids_json", JSON.stringify(placement.subcategoryIds)],
+      ["subcategory_names_json", JSON.stringify(placement.subcategoryNames)],
+      ["tags", form.tags],
+      ["is_adult", String(form.is_adult)],
+      ["visibility", form.visibility],
+      ["comments_enabled", String(form.comments_enabled)],
+      ["downloads_enabled", String(form.downloads_enabled)],
+      ["pinned", String(form.pinned)],
+      ["auto_ai", String(form.auto_ai)],
+      ["check_site_duplicates", String(form.check_site_duplicates)],
+    ];
+    if (form.source_url.trim()) fields.push(["source_url", form.source_url.trim()]);
+    if (form.publish_at) fields.push(["publish_at", new Date(form.publish_at).toISOString()]);
+    if (form.expires_in_hours) fields.push(["expires_in_hours", form.expires_in_hours]);
+    return fields;
+  }
+
+  // Sends one file's bytes and hands it to the server. Resolves with the
+  // server's reply: normally { status: "processing", job_id } (processing
+  // continues server-side), or a finished { media } from an older server.
+  // `onBytes(sent)` reports progress in bytes. Throws on failure; an error
+  // with status -1 means the user cancelled.
+  async function uploadOneFile(file, { title, description }, onBytes) {
     const uploadT0 = performance.now();
     let uploadMethod = "direct";
     let chunkCount = 0;
+    let retryCount = 0;
+    const isCancelled = () => cancelledRef.current;
+    const onRetry = () => { retryCount += 1; };
     const reportUploadDiagnostic = (outcome, errorMessage) => postClientDiagnostic("/api/media/upload/diagnostics", {
       outcome,
       method: uploadMethod,
       duration_ms: Math.round(performance.now() - uploadT0),
       bytes: file.size,
       chunk_count: chunkCount || undefined,
-      retry_count: 0, // no chunk-retry logic exists yet -- see xhrJson's single-attempt send
+      retry_count: retryCount,
       error_message: errorMessage,
     });
     try {
-      const body = new FormData();
-      body.set("file", file);
-      body.set("title", title);
-      body.set("description", description);
-      if (form.source_url.trim()) body.set("source_url", form.source_url.trim());
-      const placement = resolvePlacement(ctx.lookups.categories, form.category, form.subcategories);
-      body.set("category_id", placement.categoryId);
-      body.set("category_name", placement.categoryName);
-      body.set("subcategory_id", placement.subcategoryIds[0] || "");
-      body.set("subcategory_name", placement.subcategoryNames[0] || "");
-      body.set("subcategory_ids_json", JSON.stringify(placement.subcategoryIds));
-      body.set("subcategory_names_json", JSON.stringify(placement.subcategoryNames));
-      body.set("tags", form.tags);
-      body.set("is_adult", String(form.is_adult));
-      body.set("visibility", form.visibility);
-      body.set("comments_enabled", String(form.comments_enabled));
-      body.set("downloads_enabled", String(form.downloads_enabled));
-      body.set("pinned", String(form.pinned));
-      body.set("auto_ai", String(form.auto_ai));
-      body.set("check_site_duplicates", String(form.check_site_duplicates));
-      if (form.publish_at) body.set("publish_at", new Date(form.publish_at).toISOString());
-      if (form.expires_in_hours) body.set("expires_in_hours", form.expires_in_hours);
-
+      const fields = uploadFields({ title, description });
       let data;
-      if (file.size <= EDGE_SAFE_UPLOAD_BYTES) {
+      if (file.size <= SINGLE_REQUEST_MAX_BYTES) {
         const url = await resolveApiUrl("/api/media");
-        data = await xhrJson(url, {
-          body,
-          onProgress: (progressEvent) => {
-            if (progressEvent.lengthComputable) onProgress?.(Math.round((progressEvent.loaded / progressEvent.total) * 100));
-          },
-        });
-      } else {
-        uploadMethod = "chunked";
-        const init = await apiFetch("/api/media/upload/init", {
-          method: "POST",
-          timeoutMs: UPLOAD_TIMEOUT_MS,
-          body: JSON.stringify({ total_size: file.size, filename: file.name }),
-        });
-        const chunkSize = Number(init.chunk_size) > 0 ? Number(init.chunk_size) : DEFAULT_CHUNK_BYTES;
-        const initUrl = await resolveApiUrl("/api/media/upload/chunk");
-        let uploaded = 0;
-        for (let index = 0; uploaded < file.size; index += 1) {
-          const chunk = file.slice(uploaded, Math.min(uploaded + chunkSize, file.size));
-          await xhrJson(`${initUrl}?session_id=${encodeURIComponent(init.session_id)}&index=${index}`, {
-            body: chunk,
-            contentType: "application/octet-stream",
+        data = await withRetries(() => {
+          const body = new FormData();
+          body.set("file", file);
+          for (const [key, value] of fields) body.set(key, value);
+          body.set("defer", "true");
+          return xhrJson(url, {
+            body,
+            track: trackXhr,
             onProgress: (progressEvent) => {
-              const chunkLoaded = progressEvent.lengthComputable ? progressEvent.loaded : 0;
-              onProgress?.(Math.round(((uploaded + chunkLoaded) / file.size) * 100));
+              if (progressEvent.lengthComputable) onBytes?.(Math.round((progressEvent.loaded / progressEvent.total) * file.size));
             },
           });
-          uploaded += chunk.size;
-          chunkCount += 1;
-          onProgress?.(Math.round((uploaded / file.size) * 100));
-        }
-        const metadata = Object.fromEntries([...body.entries()].filter(([key]) => key !== "file"));
-        data = await apiFetch("/api/media/upload/finish", {
-          method: "POST",
-          // This request itself only runs the fast dry-run synchronously
-          // (magic-byte sniff of the already-assembled file, form-field
-          // validation) -- the slow part (fast-start remux, full-file
-          // sha256, up to a 30s AI vision call, disk save) now happens in a
-          // background thread server-side, so a real response normally
-          // comes back in well under a second. UPLOAD_TIMEOUT_MS here is
-          // just the shared ceiling for consistency with the other
-          // upload-related requests, not because this one needs it.
-          timeoutMs: UPLOAD_TIMEOUT_MS,
-          body: JSON.stringify({
-            ...metadata,
-            session_id: init.session_id,
-            total_size: file.size,
-          }),
+        }, { isCancelled, onRetry });
+      } else {
+        uploadMethod = "chunked";
+        const jsonRequest = async (path, payload) => xhrJson(await resolveApiUrl(path), {
+          body: JSON.stringify(payload),
+          contentType: "application/json",
+          track: trackXhr,
         });
+        const init = await withRetries(
+          () => jsonRequest("/api/media/upload/init", { total_size: file.size, filename: file.name }),
+          { isCancelled, onRetry },
+        );
+        // Servers that accept `offset` take pieces in any order, several at
+        // a time; older ones need them one by one, in order.
+        const parallel = Boolean(init.parallel);
+        const chunkSize = parallel
+          ? Math.min(PARALLEL_CHUNK_BYTES, Number(init.max_chunk_size) || PARALLEL_CHUNK_BYTES)
+          : (Number(init.chunk_size) > 0 ? Number(init.chunk_size) : 4 * 1024 * 1024);
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        const chunkUrl = await resolveApiUrl("/api/media/upload/chunk");
+        const sessionParam = encodeURIComponent(init.session_id);
+        const inFlight = new Map(); // chunk index -> bytes sent so far
+        let doneBytes = 0;
+        const reportBytes = () => {
+          let sending = 0;
+          for (const value of inFlight.values()) sending += value;
+          onBytes?.(Math.min(file.size, doneBytes + sending));
+        };
+        const sendChunk = async (index) => {
+          const start = index * chunkSize;
+          const piece = file.slice(start, Math.min(start + chunkSize, file.size));
+          await withRetries(() => {
+            inFlight.set(index, 0);
+            return xhrJson(`${chunkUrl}?session_id=${sessionParam}&index=${index}${parallel ? `&offset=${start}` : ""}`, {
+              body: piece,
+              contentType: "application/octet-stream",
+              track: trackXhr,
+              onProgress: (progressEvent) => {
+                inFlight.set(index, progressEvent.loaded || 0);
+                reportBytes();
+              },
+            });
+          }, { isCancelled, onRetry });
+          inFlight.delete(index);
+          doneBytes += piece.size;
+          chunkCount += 1;
+          reportBytes();
+        };
+        const sendRange = async (fromIndex) => {
+          let next = fromIndex;
+          let failure = null;
+          const streams = parallel ? PARALLEL_CHUNK_STREAMS : 1;
+          await Promise.all(Array.from({ length: Math.min(streams, totalChunks - fromIndex) }, async () => {
+            while (!failure && next < totalChunks) {
+              const index = next;
+              next += 1;
+              try {
+                await sendChunk(index);
+              } catch (error) {
+                failure = failure || error;
+              }
+            }
+          }));
+          if (failure) throw failure;
+        };
+        await sendRange(0);
+
+        const finishPayload = {
+          ...Object.fromEntries(fields),
+          session_id: init.session_id,
+          total_size: file.size,
+        };
+        let resentGap = false;
+        data = await withRetries(async () => {
+          try {
+            return await jsonRequest("/api/media/upload/finish", finishPayload);
+          } catch (error) {
+            // The server is missing some bytes (a piece that was lost on the
+            // way): send everything from that point again, then finish.
+            const missingFrom = Number(error.payload?.missing_from);
+            if (error.status === 400 && parallel && Number.isFinite(missingFrom) && !resentGap) {
+              resentGap = true;
+              doneBytes = missingFrom;
+              await sendRange(Math.floor(missingFrom / chunkSize));
+              return jsonRequest("/api/media/upload/finish", finishPayload);
+            }
+            throw error;
+          }
+        }, { isCancelled, onRetry });
       }
       reportUploadDiagnostic("success");
       return data;
     } catch (error) {
-      reportUploadDiagnostic("error", String(error.message || "").slice(0, 300));
+      reportUploadDiagnostic(error.status === -1 ? "cancelled" : "error", String(error.message || "").slice(0, 300));
       throw error;
+    }
+  }
+
+  function announceUploaded(data) {
+    clearApiCache();
+    ctx.refreshLookups();
+    if (!duplicates.length && data.possible_duplicates?.length) {
+      ctx.showToast(
+        `Uploaded — heads up, ${data.possible_duplicates.length} similar post${data.possible_duplicates.length === 1 ? "" : "s"} already exist in your library.`,
+        "info",
+      );
+    } else if (data.possible_site_duplicates?.length) {
+      ctx.showToast(
+        `Uploaded — heads up, ${data.possible_site_duplicates.length} similar post${data.possible_site_duplicates.length === 1 ? "" : "s"} already exist elsewhere on the site.`,
+        "info",
+      );
+    } else {
+      ctx.showToast("Upload saved.", "success");
+    }
+  }
+
+  // Follows a single upload's processing on this page (showing its stage)
+  // for up to FOLLOW_PROCESSING_MS, then opens the new post. If it takes
+  // longer -- or the user leaves, or picks "Continue in background" -- the
+  // job moves to Shell's background poller, which toasts when it's done.
+  async function followJob(jobId, filename) {
+    followJobRef.current = { jobId, filename };
+    setPhase("processing");
+    setStage("queued");
+    const deadline = Date.now() + FOLLOW_PROCESSING_MS;
+    while (followJobRef.current?.jobId === jobId && Date.now() < deadline) {
+      let data = null;
+      try {
+        data = await apiFetch(`/api/media/upload/job/${encodeURIComponent(jobId)}`);
+      } catch (_error) {
+        await sleep(1500);
+        continue;
+      }
+      if (followJobRef.current?.jobId !== jobId) return;
+      if (data.status === "done" && data.media?.id) {
+        followJobRef.current = null;
+        announceUploaded(data);
+        navigate(`/media/${data.media.id}`);
+        return;
+      }
+      if (data.status === "error" && !data.retrying) {
+        followJobRef.current = null;
+        ctx.showToast(`Upload failed: ${data.detail || "unknown error"}`, "error");
+        return;
+      }
+      setStage(data.status === "error" ? "retrying" : (data.stage || "queued"));
+      await sleep(700);
+    }
+    handOffFollowedJob(true);
+  }
+
+  function handOffFollowedJob(navigateAway) {
+    const job = followJobRef.current;
+    if (!job) return;
+    followJobRef.current = null;
+    addPendingUploadJob(job);
+    if (navigateAway) {
+      ctx.showToast("Still processing in the background — we'll let you know when it's ready.", "info");
+      navigate("/profile");
     }
   }
 
@@ -494,76 +707,96 @@ export function UploadPage({ ctx }) {
       );
       if (!proceed) return;
     }
-    setBusy(true);
-    setUploadProgress(0);
-    const hasBatch = extraFiles.length > 0;
-    try {
-      const data = await uploadOneFile(form.file, { title: form.title, description: form.description }, setUploadProgress);
 
-      if (data.status === "processing") {
-        // Chunk upload finished and the fast dry-run (file type, visibility,
-        // publish date, title/category unless AI auto-fill covers them)
-        // passed -- the slow part (remux/hash/AI/save) is now running in a
-        // background thread server-side. Hand off to Shell's job poller
-        // (survives navigation/reload since it's localStorage-backed).
-        addPendingUploadJob({ jobId: data.job_id, filename: form.file.name });
-        if (!hasBatch) {
-          ctx.showToast("Upload queued — processing in the background. We'll let you know when it's ready.", "info");
-          navigate("/profile");
-          return;
+    const entries = [
+      { id: "primary", file: form.file, title: form.title, description: form.description },
+      ...extraFiles
+        .filter((row) => row.status !== "done")
+        .map((row) => ({ id: row.id, file: row.file, title: "", description: "" })),
+    ];
+    const totalBytes = entries.reduce((sum, entry) => sum + entry.file.size, 0) || 1;
+    const sentByFile = new Map();
+    const speed = { lastT: performance.now(), lastBytes: 0, bps: 0 };
+    const onFileBytes = (id, bytes) => {
+      sentByFile.set(id, bytes);
+      let sent = 0;
+      for (const value of sentByFile.values()) sent += value;
+      setUploadProgress(Math.min(100, Math.floor((sent / totalBytes) * 100)));
+      const now = performance.now();
+      if (now - speed.lastT >= 600) {
+        const instant = ((sent - speed.lastBytes) * 1000) / (now - speed.lastT);
+        speed.bps = speed.bps ? speed.bps * 0.6 + instant * 0.4 : instant;
+        speed.lastT = now;
+        speed.lastBytes = sent;
+        setRate({ bps: speed.bps, etaSeconds: speed.bps > 0 ? (totalBytes - sent) / speed.bps : null });
+      }
+    };
+
+    cancelledRef.current = false;
+    setBusy(true);
+    setPhase("uploading");
+    setUploadProgress(0);
+    setRate(null);
+    setStage("");
+    try {
+      if (entries.length === 1) {
+        const data = await uploadOneFile(form.file, entries[0], (bytes) => onFileBytes("primary", bytes));
+        setRate(null);
+        if (data.job_id) {
+          await followJob(data.job_id, form.file.name);
+        } else if (data.media?.id) {
+          announceUploaded(data);
+          navigate(`/media/${data.media.id}`);
         }
-      } else if (!hasBatch) {
-        clearApiCache();
-        ctx.refreshLookups();
-        if (!duplicates.length && data.possible_duplicates?.length) {
-          ctx.showToast(
-            `Uploaded — heads up, ${data.possible_duplicates.length} similar post${data.possible_duplicates.length === 1 ? "" : "s"} already exist in your library.`,
-            "info",
-          );
-        } else if (data.possible_site_duplicates?.length) {
-          ctx.showToast(
-            `Uploaded — heads up, ${data.possible_site_duplicates.length} similar post${data.possible_site_duplicates.length === 1 ? "" : "s"} already exist elsewhere on the site.`,
-            "info",
-          );
-        } else {
-          ctx.showToast("Upload saved.", "success");
-        }
-        navigate(`/media/${data.media.id}`);
         return;
       }
 
-      // Batch mode: the primary file is in, now work through the queue.
-      // One failing file marks itself "error" and does NOT abort the rest
-      // -- a typo'd file somewhere in a 10-file drop shouldn't cost the
-      // other 9 their upload.
-      let succeeded = 1;
-      let failed = 0;
-      for (const row of extraFiles) {
-        setExtraFiles((current) => current.map((r) => (r.id === row.id ? { ...r, status: "uploading" } : r)));
-        try {
-          const rowData = await uploadOneFile(row.file, { title: "", description: "" });
-          if (rowData.status === "processing") {
-            addPendingUploadJob({ jobId: rowData.job_id, filename: row.file.name });
+      // Batch: two files at a time. Each one's processing continues
+      // server-side and is tracked by Shell's poller, so the page only
+      // waits for the bytes. One failure doesn't stop the rest.
+      const setRow = (id, patch) => setExtraFiles((current) => current.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+      let succeeded = 0;
+      const failures = [];
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(2, entries.length) }, async () => {
+        while (next < entries.length && !cancelledRef.current) {
+          const entry = entries[next];
+          next += 1;
+          if (entry.id !== "primary") setRow(entry.id, { status: "uploading", error: "" });
+          try {
+            const data = await uploadOneFile(entry.file, entry, (bytes) => onFileBytes(entry.id, bytes));
+            if (data.job_id) addPendingUploadJob({ jobId: data.job_id, filename: entry.file.name });
+            sentByFile.set(entry.id, entry.file.size);
+            succeeded += 1;
+            if (entry.id !== "primary") setRow(entry.id, { status: "done" });
+          } catch (error) {
+            if (error.status === -1) return;
+            failures.push(`${entry.file.name}: ${error.message}`);
+            if (entry.id !== "primary") setRow(entry.id, { status: "error", error: error.message });
           }
-          succeeded += 1;
-          setExtraFiles((current) => current.map((r) => (r.id === row.id ? { ...r, status: "done" } : r)));
-        } catch (rowError) {
-          failed += 1;
-          setExtraFiles((current) => current.map((r) => (r.id === row.id ? { ...r, status: "error", error: rowError.message } : r)));
         }
+      }));
+      if (cancelledRef.current) {
+        ctx.showToast(succeeded ? `Cancelled — ${succeeded} file${succeeded === 1 ? " was" : "s were"} already sent and will still be posted.` : "Upload cancelled.", "info");
+        return;
       }
       clearApiCache();
       ctx.refreshLookups();
-      ctx.showToast(
-        failed ? `Uploaded ${succeeded} of ${succeeded + failed} files — ${failed} failed.` : `All ${succeeded} files uploaded.`,
-        failed ? "info" : "success",
-      );
+      if (failures.length) {
+        ctx.showToast(`Sent ${succeeded} of ${entries.length} files — ${failures.length} failed (${failures[0]}).`, "error");
+        if (!succeeded) return;
+      } else {
+        ctx.showToast(`All ${succeeded} files sent — they're processing now. We'll let you know as each one is ready.`, "success");
+      }
       navigate("/profile");
     } catch (error) {
-      ctx.showToast(error.message, "error");
+      if (error.status === -1) ctx.showToast("Upload cancelled.", "info");
+      else ctx.showToast(error.message, "error");
       setUploadProgress(0);
     } finally {
       setBusy(false);
+      setPhase("idle");
+      setRate(null);
     }
   }
 
@@ -578,6 +811,7 @@ export function UploadPage({ ctx }) {
     ? [analysis.media_kind, analysis.source, analysis.category_name, ...(analysis.subcategory_names || []), ...((analysis.tags || []).slice(0, 4))].filter(Boolean)
     : [];
   const uploading = busy && !analyzing;
+  const processing = phase === "processing";
   const fileFacts = form.file
     ? [
       isVideo ? "Video" : "Image",
@@ -587,7 +821,16 @@ export function UploadPage({ ctx }) {
     ].filter(Boolean)
     : [];
   let status = "Choose a file to get started.";
-  if (uploading) status = uploadProgress >= 100 ? "Finishing up…" : `Uploading… ${uploadProgress}%`;
+  if (processing) status = describeUploadStage(stage);
+  else if (uploading) {
+    status = uploadProgress >= 100
+      ? "Handing off to the server…"
+      : [
+        `Uploading… ${uploadProgress}%`,
+        rate?.bps > 0 ? `${formatBytes(rate.bps)}/s` : "",
+        rate?.etaSeconds != null && rate.etaSeconds >= 1 ? `${formatDuration(rate.etaSeconds)} left` : "",
+      ].filter(Boolean).join(" · ");
+  }
   else if (analyzing) status = "Analyzing with AI…";
   else if (tooBig) status = `Over the ${formatBytes(MAX_UPLOAD_BYTES)} limit — choose a smaller file.`;
   else if (form.file && !form.title.trim() && !form.auto_ai) status = "Add a title, or turn on AI metadata to fill it in.";
@@ -863,13 +1106,24 @@ export function UploadPage({ ctx }) {
           <div className="upload-actionbar">
             <div className="upload-status">
               <span className={tooBig ? "is-error" : ""}>{status}</span>
-              {uploading && uploadProgress > 0 ? (
+              {processing ? (
+                <div className="upload-progress-track is-indeterminate" role="progressbar" aria-label="Processing">
+                  <div className="upload-progress-fill" />
+                </div>
+              ) : uploading && uploadProgress > 0 ? (
                 <div className="upload-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={uploadProgress} aria-label="Upload progress">
                   <div className="upload-progress-fill" style={{ width: `${uploadProgress}%` }} />
                 </div>
               ) : null}
             </div>
-            <button className="primary" type="submit" disabled={busy || !form.file || tooBig}><Upload size={16} />{uploading ? "Uploading" : "Upload"}</button>
+            {processing ? (
+              <button type="button" onClick={() => handOffFollowedJob(true)}>Continue in background</button>
+            ) : uploading ? (
+              <button type="button" onClick={cancelUpload}><X size={16} />Cancel</button>
+            ) : null}
+            <button className="primary" type="submit" disabled={busy || !form.file || tooBig}>
+              <Upload size={16} />{processing ? "Processing" : uploading ? "Uploading" : "Upload"}
+            </button>
           </div>
         </div>
       </form>

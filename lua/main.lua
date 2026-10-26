@@ -471,6 +471,16 @@ local image_warmer_enabled = (os.getenv("GALLERY_ENABLE_IMAGE_WARMER") or "true"
 image_warmer_enabled = image_warmer_enabled == "true" or image_warmer_enabled == "1" or image_warmer_enabled == "yes"
 if is_primary_worker and image_warmer_enabled then routes.start_image_rendition_warmer() end
 
+-- Upload storage (see routes.lua's upload hand-off section): every worker
+-- turns on the fast-disk tier (if GALLERY_HOT_DIR is set) and records its
+-- boot id; the primary resumes upload jobs whose worker restarted and
+-- keeps the fast tier under its size cap.
+routes.configure_storage()
+if is_primary_worker then
+  routes.start_upload_job_recovery()
+  routes.start_hot_tier_mover()
+end
+
 httpd.listen(settings.host, settings.port)
 print(string.format("[nyxframe] listening on %s:%d", settings.host, settings.port))
 httpd.run()

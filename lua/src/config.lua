@@ -103,6 +103,16 @@ function M.load()
     -- bind-mounted (same requirement the Python backend already has) and
     -- GALLERY_UPLOADS_DIR pointed at wherever it's mounted.
     uploads_dir = env("GALLERY_UPLOADS_DIR", "../uploads"):gsub("/+$", ""),
+    -- Fast-disk tier (2026-10-26). When set (a directory on fast internal
+    -- storage), uploads are received and processed under <hot_dir>/staging
+    -- and new originals are stored under <hot_dir>/media/... with the same
+    -- relative layout as uploads_dir. Lookups check hot_dir first, then
+    -- uploads_dir; a background mover shifts the oldest originals to
+    -- uploads_dir once hot_dir's media passes hot_max_gb. Empty = off
+    -- (everything stays in uploads_dir, as before).
+    hot_dir = env("GALLERY_HOT_DIR", ""):gsub("/+$", ""),
+    hot_max_gb = math.max(1, env_int("GALLERY_HOT_MAX_GB", 25)),
+    hot_min_free_gb = math.max(1, env_int("GALLERY_HOT_MIN_FREE_GB", 15)),
     storage_backend = env("GALLERY_STORAGE_BACKEND", "database"),
     max_upload_bytes = env_int("GALLERY_MAX_UPLOAD_BYTES", 3 * 1024 * 1024 * 1024),
     upload_rate_limit_per_hour = math.max(1, env_int("GALLERY_UPLOAD_RATE_LIMIT_PER_HOUR", 60)),

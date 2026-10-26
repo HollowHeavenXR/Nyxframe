@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { Activity, AlertTriangle, Code2, Folder, Gift, Grid3X3, Heart, Home, Image as ImageIcon, LogIn, LogOut, MessageCircle, Moon, MoreHorizontal, Rocket, Search as SearchIcon, Settings, ShieldAlert, Sparkles, Sun, SunMoon, TrendingUp, Upload, UserPlus, Users, Wand2, X as XIcon } from "lucide-react";
-import { apiFetch, cachedApiFetch } from "../api.js";
+import { apiFetch, cachedApiFetch, clearApiCache } from "../api.js";
 import { useLiveRefresh } from "../hooks/useLiveRefresh.js";
 import { getPendingUploadJobs, removePendingUploadJob } from "../uploadJobs.js";
 import { Avatar, BackToTop, GlassFilterDefs, glassPointerMove } from "./ui.jsx";
@@ -158,7 +158,10 @@ export function Shell({ ctx, children, className = "", style }) {
         if (data.status === "processing" || (data.status === "error" && data.retrying)) return;
         removePendingUploadJob(job.jobId);
         if (data.status === "done") {
-          ctx.showToast(`"${job.filename}" finished uploading.`, "success");
+          ctx.showToast(`"${job.filename}" is ready.`, "success");
+          // Lists cached before the post existed (profile, home) would
+          // otherwise keep showing the gallery without it.
+          clearApiCache();
           ctx.refreshLookups();
         } else {
           ctx.showToast(`Upload of "${job.filename}" failed: ${data.detail || "unknown error"}`, "error");

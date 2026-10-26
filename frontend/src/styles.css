@@ -8306,9 +8306,35 @@ select option {
   transition: width 200ms ease;
 }
 
+/* Server-side processing: no byte count to show, so a sliding segment.
+   transform-only animation (compositor, no layout per frame). */
+.upload-progress-track.is-indeterminate .upload-progress-fill {
+  width: 35%;
+  transition: none;
+  animation: upload-progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes upload-progress-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(290%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upload-progress-track.is-indeterminate .upload-progress-fill {
+    width: 100%;
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
 .upload-actionbar button.primary {
   flex: 0 0 auto;
   min-width: 132px;
+  border-radius: 999px;
+}
+
+.upload-actionbar button:not(.primary) {
+  flex: 0 0 auto;
   border-radius: 999px;
 }
 

@@ -3755,19 +3755,6 @@ local function source_sha256(source)
   return media_files.sha256_file(source.file_path)
 end
 
--- Fingerprinting is image-only, and images realistically never approach
--- the size where holding one fully in memory matters -- so the file_path
--- case just reads the whole (small) file once here rather than needing
--- its own streaming image_fingerprint variant.
-local function source_content_for_fingerprint(source)
-  if source.content then return source.content end
-  local f = io.open(source.file_path, "rb")
-  if not f then return nil end
-  local content = f:read("*a")
-  f:close()
-  return content
-end
-
 -- Forward-declared: the actual function is assigned further down (after
 -- shell_quote/ffmpeg_bin exist) since Lua locals are only visible to code
 -- after their declaration -- this `local` here just reserves the upvalue
@@ -3776,7 +3763,13 @@ end
 -- further down has already happened.
 local fast_start_remux_if_needed
 
-local function finalize_upload(req, user, source, original_filename, form)
+-- `on_stage` (optional) is called with a short stage name as processing
+-- moves along ("optimizing", "analyzing", "fingerprinting", "saving",
+-- "finishing") -- the background job runner uses it for the status the
+-- uploader sees. Second argument: the new media id (at "finishing", once
+-- the row exists); third: the replacement source after a remux.
+local function finalize_upload(req, user, source, original_filename, form, on_stage)
+  local stage = on_stage or function() end
   local debug_t0 = os.time()
   finalize_upload_debug_mark("start", debug_t0)
   local sniffed_mime, media_kind = sniff_magic(source_sniff_prefix(source))
@@ -3790,8 +3783,37 @@ local function finalize_upload(req, user, source, original_filename, form)
   -- touches `source`, so AI frame sampling, sha256, and the actual on-disk
   -- save all see the fixed-up bytes. See the function's own header comment
   -- (below, after ffmpeg_bin) for why this matters.
+  if media_kind == "video" then stage("optimizing") end
+  local pre_remux_path = source.file_path
   source = fast_start_remux_if_needed(source, sniffed_mime)
+  -- The remux replaces (and deletes) the original file: tell the job
+  -- runner, so a retry or a post-restart resume reads the new one.
+  if pre_remux_path and source.file_path ~= pre_remux_path then stage("optimizing", nil, source) end
   finalize_upload_debug_mark("fast_start_remux done", debug_t0)
+
+  -- Hash + image fingerprint run in their own thread while the AI call
+  -- below waits on the network (both only read the now-final bytes), so
+  -- they no longer add their time on top of it. Joined before first use.
+  local pre = { done = false }
+  do
+    local copas_ok, copas = pcall(require, "copas")
+    local function compute()
+      local ok, err = pcall(function()
+        pre.sha256 = source_sha256(source)
+        if media_kind == "image" then
+          pre.fingerprint = source.file_path and media_files.image_fingerprint_from_path(source.file_path)
+            or media_files.image_fingerprint(source.content)
+        end
+      end)
+      if not ok then pre.err = err end
+      pre.done = true
+    end
+    if copas_ok and coroutine.running() then copas.addthread(compute) else compute() end
+    pre.wait = function()
+      while not pre.done do copas.sleep(0.02) end
+      if pre.err then error(pre.err) end
+    end
+  end
 
   local title_raw = trim(nn(form.title) or ""):sub(1, 160)
   local description_raw = trim(nn(form.description) or "")
@@ -3837,6 +3859,7 @@ local function finalize_upload(req, user, source, original_filename, form)
   -- broken/unreachable AI provider must never fail the upload itself).
   local analysis = nil
   if auto_ai and M.settings.ai_enabled and (media_kind == "image" or media_kind == "video") then
+    stage("analyzing")
     local telemetry_t0 = M.telemetry.now()
     local ok, result = pcall(ai_metadata.analyze_media_bytes, {
       content = source.content, file_path = source.file_path, filename = original_filename, mime_type = sniffed_mime, media_kind = media_kind,
@@ -3907,12 +3930,14 @@ local function finalize_upload(req, user, source, original_filename, form)
   if not resolved_subcategory_ids then return 400, { detail = subcat_err } end
   local subcategory_id = resolved_subcategory_ids[1]
 
-  local sha256 = source_sha256(source)
+  if not pre.done then stage("fingerprinting") end
+  pre.wait()
+  local sha256 = pre.sha256
   finalize_upload_debug_mark("sha256 done", debug_t0)
   local moderation = moderate_upload(title, description, tags, original_filename, sniffed_mime,
     is_adult_input or (analysis and analysis.is_adult) or false)
 
-  local fingerprint = media_kind == "image" and media_files.image_fingerprint(source_content_for_fingerprint(source)) or nil
+  local fingerprint = pre.fingerprint
   local possible_duplicates = find_possible_duplicates(req, user.id, fingerprint)
   -- Site-wide check is opt-in per upload (not automatic) so the default
   -- upload response/behavior for everyone who doesn't set this flag is
@@ -3922,6 +3947,7 @@ local function finalize_upload(req, user, source, original_filename, form)
     or {}
   finalize_upload_debug_mark("moderation/fingerprint/dupes done", debug_t0)
 
+  stage("saving")
   local media_file, save_err = media_files.save_media_file_to_disk(M.settings.uploads_dir, {
     content = source.content,
     source_path = source.file_path,
@@ -3981,7 +4007,25 @@ local function finalize_upload(req, user, source, original_filename, form)
   local media_id = db.toint(row.id, row.id)
   write_media_subcategories(media_id, resolved_subcategory_ids)
 
+  stage("finishing", media_id)
   local item = fetch_media_by_id(media_id, tostring(user.id))
+  -- Pre-render the grid/lightbox/detail image sizes right away rather than
+  -- waiting for the warmer's next round, so the uploader's first look at
+  -- the post (usually seconds from now) is already warm. Own thread, so
+  -- this response never waits on it.
+  if media_kind == "image" and item then
+    local warm_row = {
+      id = media_id, media_kind = "image", mime_type = item.mime_type, original_filename = item.original_filename,
+      storage_path = item.storage_path, created_at = item.created_at, updated_at = item.updated_at,
+    }
+    local copas_ok, copas = pcall(require, "copas")
+    if copas_ok then
+      copas.addthread(function()
+        local ok, err = pcall(M._warm_image_renditions, warm_row)
+        if not ok then print("[nyxframe] upload prewarm failed for media " .. tostring(media_id) .. ": " .. tostring(err)) end
+      end)
+    end
+  end
   local adult_allowed = viewer_adult_allowed(tostring(user.id))
   local enriched = decode_media_row(item, adult_allowed, req)
   finalize_upload_debug_mark("decode_media_row done", debug_t0)
@@ -4040,6 +4084,17 @@ function M.upload_media(req)
   if rl_status then return rl_status, rl_body end
 
   local original_filename = ((upload.filename or "upload"):match("([^/\\]+)$") or "upload"):sub(1, 255)
+
+  -- defer=true (the website sends this): don't hold the request open for
+  -- processing (remux/AI/hash/save). The bytes go to a staging file and
+  -- the same background job the chunked path uses takes it from there;
+  -- the client gets 202 + job_id right after the quick checks pass.
+  -- Without it (older iOS builds), the response still carries the
+  -- finished media exactly as before.
+  if form_bool(form.defer, false) then
+    return M._upload_handoff_bytes(req, user, upload.content, original_filename, form)
+  end
+
   local telemetry_t0 = M.telemetry.now()
   local up_status, up_body, up_headers = finalize_upload(req, user, { content = upload.content }, original_filename, form)
   M.telemetry.record("upload", "direct", up_status == 200 and "success" or "error", M.telemetry.ms_since(telemetry_t0),
@@ -4056,8 +4111,8 @@ end
 -- to that edge limit; anything larger (most videos with the cap now raised
 -- to 700MB) has to be split into several sub-100MB requests instead of one,
 -- which is what this session-based init/append/finish flow does. Sessions
--- live in-process only (no DB table, no clustering here) and are pruned
--- lazily on each init call rather than on a timer.
+-- are small JSON files next to the staging file (shared by every worker
+-- process), pruned in the background at most every 10 minutes.
 -- ---------------------------------------------------------------------------
 
 -- Lua's %q escapes for a *Lua* string literal, not a shell argument -- use
@@ -4076,29 +4131,43 @@ end
 local UPLOAD_CHUNK_SESSION_TTL_SECONDS = 2 * 3600
 local upload_chunk_storage = {}
 
--- Guardrail, 2026-10-22: caps how many finalize_upload background jobs
--- THIS worker process will run at once. In-memory, not file-based like
--- upload_chunk_storage's other state -- this is specifically about one
--- worker's own concurrent load, which the others behind nyxframe-proxy
--- don't share (proxy.lua's least-connections routing already steers new
--- connections away from a busy worker; this is the backstop for a burst
--- that still lands more uploads on one worker than it should take at once).
--- "Degrades gracefully, don't queue" -- same philosophy acquire_transcode_slot
--- already uses -- so a caller over the cap gets 503 + Retry-After instead
--- of piling up behind the ones already running.
+-- Upload hand-off pipeline (reworked 2026-10-26).
+--
+-- Bytes arrive one of three ways -- a single multipart POST (direct), the
+-- iOS app's in-order chunks (index only), or the website's parallel chunks
+-- (index + offset, any order) -- and land in a staging file. From there a
+-- background job does the slow part (faststart remux, hash, fingerprint,
+-- AI metadata, store, DB insert) while the client polls
+-- /api/media/upload/job/:id.
+--
+-- Jobs are files (staging dir), not memory, because the proxy spreads
+-- requests over several worker processes. Each job records which worker
+-- owns it and that worker's boot id; the primary worker resumes jobs whose
+-- owner has since restarted (deploys, crashes), so a restart no longer
+-- loses an upload that was mid-processing.
+--
+-- At most FINALIZE_MAX_CONCURRENT jobs run per worker; extra ones wait
+-- their turn as "queued" instead of being rejected.
 upload_chunk_storage.active_finalize_jobs = 0
 upload_chunk_storage.FINALIZE_MAX_CONCURRENT = 3
+-- Largest single chunk accepted: the whole request body is held in memory.
+upload_chunk_storage.MAX_CHUNK_BYTES = 16 * 1024 * 1024
+upload_chunk_storage.boot_id = "unset" -- set by M.configure_storage()
+upload_chunk_storage.last_prune = 0
 
-function upload_chunk_storage.session_path(session_id)
-  return M.settings.uploads_dir .. "/_upload_sessions_" .. tostring(session_id) .. ".json"
+-- Staging lives on the fast-disk tier when configured (config.lua's
+-- hot_dir); otherwise in uploads_dir, as before.
+function upload_chunk_storage.dir()
+  local hot = M.settings.hot_dir
+  if hot and hot ~= "" then return hot .. "/staging" end
+  return M.settings.uploads_dir
 end
 
-function upload_chunk_storage.write(session_id, session)
-  local path = upload_chunk_storage.session_path(session_id)
+function upload_chunk_storage.write_json(path, value)
   local tmp = path .. ".tmp." .. tostring(math.random(100000, 999999))
   local f, err = io.open(tmp, "wb")
   if not f then return nil, err end
-  f:write(cjson.encode(session))
+  f:write(cjson.encode(value))
   f:close()
   local ok, rename_err = os.rename(tmp, path)
   if not ok then
@@ -4108,92 +4177,410 @@ function upload_chunk_storage.write(session_id, session)
   return true
 end
 
-function upload_chunk_storage.read(session_id)
-  local f = io.open(upload_chunk_storage.session_path(session_id), "rb")
+function upload_chunk_storage.read_json(path)
+  local f = io.open(path, "rb")
   if not f then return nil end
   local text = f:read("*a")
   f:close()
-  local ok, session = pcall(cjson.decode, text or "")
-  return ok and type(session) == "table" and session or nil
+  local ok, value = pcall(cjson.decode, text or "")
+  return ok and type(value) == "table" and value or nil
+end
+
+function upload_chunk_storage.session_path(session_id)
+  return upload_chunk_storage.dir() .. "/_upload_sessions_" .. tostring(session_id) .. ".json"
+end
+
+function upload_chunk_storage.write(session_id, session)
+  return upload_chunk_storage.write_json(upload_chunk_storage.session_path(session_id), session)
+end
+
+function upload_chunk_storage.read(session_id)
+  return upload_chunk_storage.read_json(upload_chunk_storage.session_path(session_id))
 end
 
 function upload_chunk_storage.remove(session_id)
   os.remove(upload_chunk_storage.session_path(session_id))
 end
 
-function upload_chunk_storage.prune()
-  local now = os.time()
-  local handle = io.popen(string.format(
-    "find %s -maxdepth 1 -type f -name '_upload_sessions_*.json' -print 2>/dev/null",
-    shell_quote(M.settings.uploads_dir)
-  ))
-  if not handle then return end
-  for path in handle:lines() do
-    local session_id = path:match("_upload_sessions_([%x]+)%.json$")
-    local session = session_id and upload_chunk_storage.read(session_id)
-    if not session or now - (tonumber(session.created_at) or 0) > UPLOAD_CHUNK_SESSION_TTL_SECONDS then
-      if session and session.temp_path then pcall(os.remove, session.temp_path) end
-      pcall(os.remove, path)
-    end
-  end
-  handle:close()
-end
-
--- Background-finish job status, file-based for the exact same reason
--- upload_chunk_storage is: nyxframe-proxy round-robins requests across TWO
--- worker processes (nyxframe-lua@8790/@8791), so an in-memory Lua table in
--- one worker would be invisible to a status poll that happens to land on
--- the other one. Both workers share the same uploads_dir on disk. Hung off
--- upload_chunk_storage itself (job_* fields) rather than a second top-level
--- local -- routes.lua's main chunk was already sitting right at Lua's
--- 200-local ceiling (LUAI_MAXVARS), confirmed live: adding even one more
--- top-level local here broke `luajit -e "loadfile(...)"` with "main
--- function has more than 200 local variables".
 function upload_chunk_storage.job_path(job_id)
-  return M.settings.uploads_dir .. "/_upload_jobs_" .. tostring(job_id) .. ".json"
+  return upload_chunk_storage.dir() .. "/_upload_jobs_" .. tostring(job_id) .. ".json"
 end
 
 function upload_chunk_storage.job_write(job_id, job)
-  local path = upload_chunk_storage.job_path(job_id)
-  local tmp = path .. ".tmp." .. tostring(math.random(100000, 999999))
-  local f, err = io.open(tmp, "wb")
-  if not f then return nil, err end
-  f:write(cjson.encode(job))
-  f:close()
-  local ok, rename_err = os.rename(tmp, path)
-  if not ok then
-    os.remove(tmp)
-    return nil, rename_err
-  end
-  return true
+  return upload_chunk_storage.write_json(upload_chunk_storage.job_path(job_id), job)
 end
 
 function upload_chunk_storage.job_read(job_id)
-  local f = io.open(upload_chunk_storage.job_path(job_id), "rb")
-  if not f then return nil end
-  local text = f:read("*a")
-  f:close()
-  local ok, job = pcall(cjson.decode, text or "")
-  return ok and type(job) == "table" and job or nil
+  return upload_chunk_storage.read_json(upload_chunk_storage.job_path(job_id))
 end
 
--- Same lazy-prune-on-init pattern as upload_chunk_storage.prune() -- no
--- timer, just swept the next time anyone starts an upload.
-function upload_chunk_storage.job_prune()
-  local now = os.time()
+function upload_chunk_storage.worker_boot_path(port)
+  return upload_chunk_storage.dir() .. "/_upload_worker_" .. tostring(port) .. ".boot"
+end
+
+function upload_chunk_storage.list(glob)
+  local out = {}
+  local handle = io.popen(string.format("find %s -maxdepth 1 -type f -name %s -print 2>/dev/null",
+    shell_quote(upload_chunk_storage.dir()), shell_quote(glob)))
+  if not handle then return out end
+  for path in handle:lines() do out[#out + 1] = path end
+  handle:close()
+  return out
+end
+
+-- Abandoned sessions (no chunk written for 2h), stray direct-upload and
+-- remux scratch files, and job records older than a day.
+function upload_chunk_storage.prune()
+  local dir = shell_quote(upload_chunk_storage.dir())
+  local minutes = math.floor(UPLOAD_CHUNK_SESSION_TTL_SECONDS / 60)
   local handle = io.popen(string.format(
-    "find %s -maxdepth 1 -type f -name '_upload_jobs_*.json' -print 2>/dev/null",
-    shell_quote(M.settings.uploads_dir)
-  ))
-  if not handle then return end
-  for path in handle:lines() do
-    local job_id = path:match("_upload_jobs_([%x]+)%.json$")
-    local job = job_id and upload_chunk_storage.job_read(job_id)
-    if not job or now - (tonumber(job.created_at) or 0) > 24 * 3600 then -- 24h TTL
+    "find %s -maxdepth 1 -type f -name '_upload_sessions_*.part' -mmin +%d -print 2>/dev/null", dir, minutes))
+  if handle then
+    for path in handle:lines() do
+      local session_id = path:match("_upload_sessions_([%x]+)%.part$")
       pcall(os.remove, path)
+      pcall(os.remove, path .. ".log")
+      if session_id then upload_chunk_storage.remove(session_id) end
+    end
+    handle:close()
+  end
+  os.execute(string.format(
+    "nice -n 10 find %s -maxdepth 1 -type f \\( -name '_upload_direct_*.part' -o -name 'faststart_*' -o -name '*.tmp.*' \\) -mmin +1440 -delete 2>/dev/null;"
+      .. " find %s -maxdepth 1 -type f \\( -name '_upload_jobs_*.json' -o -name '_upload_sessions_*.json' \\) -mmin +1440 -delete 2>/dev/null",
+    dir, dir))
+end
+
+-- At most every 10 minutes per worker, off the request path.
+function upload_chunk_storage.maybe_prune()
+  if os.time() - upload_chunk_storage.last_prune < 600 then return end
+  upload_chunk_storage.last_prune = os.time()
+  require("copas").addthread(function()
+    local ok, err = pcall(upload_chunk_storage.prune)
+    if not ok then print("[nyxframe] upload prune failed: " .. tostring(err)) end
+  end)
+end
+
+-- Just the headers request_origin() reads -- what finalize_upload needs
+-- from `req` to build absolute URLs. Stored with the job so a resumed job
+-- (see recover_jobs) can rebuild a request; never the auth headers.
+function upload_chunk_storage.safe_headers(req)
+  local h = req.headers or {}
+  return { host = h.host, ["x-forwarded-proto"] = h["x-forwarded-proto"], ["x-forwarded-host"] = h["x-forwarded-host"] }
+end
+
+-- Cheap checks run before handing off, so obvious mistakes (wrong file
+-- type, bad visibility, unparseable date, missing title/category with AI
+-- auto-fill off) are reported while the client is still waiting.
+-- Title/category left blank WITH auto-fill on resolve during the job.
+function upload_chunk_storage.precheck(temp_path, filename, form)
+  local prefix = ""
+  local f = io.open(temp_path, "rb")
+  if f then
+    prefix = f:read(512) or ""
+    f:close()
+  end
+  local sniffed_mime = sniff_magic(prefix)
+  if not sniffed_mime then return 400, { detail = "Unsupported or invalid file bytes." } end
+  if not safe_extension(filename, sniffed_mime) then return 400, { detail = "Unsupported file extension." } end
+  local visibility = (nn(form.visibility) or "public"):lower()
+  if visibility ~= "public" and visibility ~= "unlisted" and visibility ~= "private" then
+    return 400, { detail = "Visibility must be public, unlisted, or private." }
+  end
+  local _, publish_at_err = parse_publish_at(form.publish_at)
+  if publish_at_err then return 400, { detail = publish_at_err } end
+  local auto_ai = form_bool(form.auto_ai, true)
+  if trim(nn(form.title) or "") == "" and not auto_ai then return 400, { detail = "Title is required." } end
+  local category_id = tonumber(form.category_id)
+  local has_category_name = nn(form.category_name) and trim(form.category_name) ~= ""
+  if not (category_id and category_id > 0) and not has_category_name and not auto_ai then
+    return 400, { detail = "Category is required." }
+  end
+  return nil
+end
+
+-- The full media object for a finished post, as finalize_upload returns
+-- it -- for a job that died after its DB insert (see run_job/recover_jobs).
+function upload_chunk_storage.done_response(req, user, media_id)
+  local item = fetch_media_by_id(media_id, tostring(user.id))
+  if not item then return nil end
+  return { media = decode_media_row(item, viewer_adult_allowed(tostring(user.id)), req),
+    possible_duplicates = arr({}), possible_site_duplicates = arr({}) }
+end
+
+function upload_chunk_storage.start_job(req, user, temp_path, total_size, filename, form)
+  local bad_status, bad_body = upload_chunk_storage.precheck(temp_path, filename, form)
+  if bad_status then
+    pcall(os.remove, temp_path)
+    return bad_status, bad_body
+  end
+  local job_id = sodium.sodium_bin2hex(sodium.randombytes_buf(16))
+  local job = {
+    user_id = user.id, status = "queued", stage = "queued", created_at = os.time(), heartbeat = os.time(),
+    filename = filename, size = total_size,
+    owner_port = M.settings.port, owner_boot = upload_chunk_storage.boot_id,
+    input = { temp_path = temp_path, total_size = total_size, filename = filename, form = form,
+      headers = upload_chunk_storage.safe_headers(req) },
+  }
+  local saved, save_err = upload_chunk_storage.job_write(job_id, job)
+  if not saved then
+    pcall(os.remove, temp_path)
+    return 500, { detail = "Could not queue upload for processing: " .. tostring(save_err) }
+  end
+  require("copas").addthread(function() upload_chunk_storage.run_job(job_id, job, req, user) end)
+  return 202, { status = "processing", job_id = job_id }
+end
+
+-- Runs one job to completion in its own copas thread. Retries transient
+-- failures (Lua error or 5xx) up to 3 attempts, never a 4xx (bad input
+-- would fail the same way again), and never once the DB insert happened
+-- (stage "finishing" carries the new media id) -- a retry past that point
+-- would create a duplicate post, so it reports the post as done instead.
+function upload_chunk_storage.run_job(job_id, job, req, user)
+  local copas = require("copas")
+  local input = job.input
+  local temp_path, total_size = input.temp_path, input.total_size
+  local function save(fields)
+    for k, v in pairs(fields) do job[k] = v end
+    job.heartbeat = os.time()
+    upload_chunk_storage.job_write(job_id, job)
+  end
+  local function finish(fields)
+    job.input = nil
+    save(fields)
+    pcall(os.remove, temp_path)
+  end
+
+  local last_beat = os.time()
+  while upload_chunk_storage.active_finalize_jobs >= upload_chunk_storage.FINALIZE_MAX_CONCURRENT do
+    copas.sleep(0.25)
+    if os.time() - last_beat >= 15 then
+      save({})
+      last_beat = os.time()
     end
   end
-  handle:close()
+  upload_chunk_storage.active_finalize_jobs = upload_chunk_storage.active_finalize_jobs + 1
+  save({ status = "processing", stage = "starting" })
+
+  local ok_run, run_err = pcall(function()
+    local MAX_ATTEMPTS = 3
+    local BACKOFF_SECONDS = { 3, 10 }
+    local attempt = 1
+    while true do
+      local telemetry_t0 = M.telemetry.now()
+      local ok, status_code, resp_body = pcall(finalize_upload, req, user,
+        { file_path = temp_path, file_size = total_size }, input.filename, input.form,
+        function(stage, media_id, new_source)
+          if new_source and new_source.file_path then
+            temp_path, total_size = new_source.file_path, new_source.file_size or total_size
+            input.temp_path, input.total_size = temp_path, total_size
+          end
+          save({ status = "processing", stage = stage, retrying = false, media_id = media_id or job.media_id })
+        end)
+      local duration_ms = M.telemetry.ms_since(telemetry_t0)
+
+      if ok and status_code == 200 then
+        M.telemetry.record("upload", "chunked", "success", duration_ms,
+          { bytes = total_size, media_id = resp_body and resp_body.media and resp_body.media.id or nil, attempts = attempt })
+        finish({ status = "done", stage = "done", response = resp_body, attempts = attempt })
+        return
+      end
+
+      local detail = ok and ((resp_body and resp_body.detail) or "Upload failed.") or tostring(status_code)
+      if not ok then
+        print("[nyxframe] background upload finish error (job " .. job_id .. ", attempt " .. attempt .. "): " .. detail)
+      end
+      M.telemetry.record("upload", "chunked", "error", duration_ms,
+        { bytes = total_size, status = ok and status_code or nil, detail = detail:sub(1, 300), attempt = attempt })
+
+      if job.media_id then
+        local done = upload_chunk_storage.done_response(req, user, job.media_id)
+        if done then
+          finish({ status = "done", stage = "done", response = done, attempts = attempt })
+          return
+        end
+      end
+
+      local retryable = (not ok) or (type(status_code) == "number" and status_code >= 500)
+      local source_still_present = io.open(temp_path, "rb")
+      if source_still_present then source_still_present:close() end
+      if not retryable or not source_still_present or attempt >= MAX_ATTEMPTS then
+        finish({ status = "error", detail = ok and detail or "Upload processing failed unexpectedly.",
+          attempts = attempt, retrying = false })
+        return
+      end
+
+      -- Recorded as a failure with retrying=true before the backoff, so a
+      -- poll in this window sees what happened rather than a stale stage.
+      save({ status = "error", detail = detail, attempts = attempt, retrying = true })
+      copas.sleep(BACKOFF_SECONDS[attempt] or BACKOFF_SECONDS[#BACKOFF_SECONDS])
+      attempt = attempt + 1
+    end
+  end)
+  upload_chunk_storage.active_finalize_jobs = upload_chunk_storage.active_finalize_jobs - 1
+  if not ok_run then
+    print("[nyxframe] upload job " .. job_id .. " crashed: " .. tostring(run_err))
+    finish({ status = "error", detail = "Upload processing failed unexpectedly.", retrying = false })
+  end
+end
+
+-- Primary worker only (see M.start_upload_job_recovery): picks up jobs
+-- whose owning worker has restarted since it took them.
+function upload_chunk_storage.recover_jobs()
+  local copas = require("copas")
+  for _, path in ipairs(upload_chunk_storage.list("_upload_jobs_*.json")) do
+    local job_id = path:match("_upload_jobs_([%x]+)%.json$")
+    local job = job_id and upload_chunk_storage.job_read(job_id)
+    local unfinished = job and job.input and (job.status == "queued" or job.status == "processing"
+      or (job.status == "error" and job.retrying))
+    if unfinished then
+      local bf = io.open(upload_chunk_storage.worker_boot_path(job.owner_port), "rb")
+      local current_boot = bf and bf:read("*a")
+      if bf then bf:close() end
+      if current_boot ~= job.owner_boot then
+        local user = get_user(job.user_id)
+        local req = { method = "POST", path = "/api/media/upload/finish", headers = job.input.headers or {}, query = {}, params = {} }
+        local src = io.open(job.input.temp_path, "rb")
+        if src then src:close() end
+        local done = user and job.media_id and upload_chunk_storage.done_response(req, user, job.media_id)
+        if done then
+          job.input = nil
+          job.status, job.stage, job.response, job.retrying = "done", "done", done, false
+          upload_chunk_storage.job_write(job_id, job)
+        elseif user and src then
+          print("[nyxframe] resuming upload job " .. job_id .. " (its worker restarted)")
+          job.owner_port, job.owner_boot = M.settings.port, upload_chunk_storage.boot_id
+          job.status, job.stage, job.retrying = "queued", "queued", false
+          upload_chunk_storage.job_write(job_id, job)
+          copas.addthread(function() upload_chunk_storage.run_job(job_id, job, req, user) end)
+        else
+          job.input = nil
+          job.status, job.retrying = "error", false
+          job.detail = "Processing was interrupted by a server restart. Please upload the file again."
+          upload_chunk_storage.job_write(job_id, job)
+        end
+      end
+    end
+  end
+end
+
+-- Called once per worker at startup (main.lua): turns on the fast-disk
+-- tier and records this worker's boot id for job ownership.
+function M.configure_storage()
+  local hot = M.settings.hot_dir
+  if hot and hot ~= "" then
+    os.execute("mkdir -p " .. shell_quote(hot .. "/staging") .. " " .. shell_quote(hot .. "/media"))
+    media_files.hot_root = hot
+  end
+  upload_chunk_storage.boot_id = sodium.sodium_bin2hex(sodium.randombytes_buf(8))
+  local f = io.open(upload_chunk_storage.worker_boot_path(M.settings.port), "wb")
+  if f then
+    f:write(upload_chunk_storage.boot_id)
+    f:close()
+  end
+end
+
+function M.start_upload_job_recovery()
+  local copas = require("copas")
+  copas.addthread(function()
+    copas.sleep(5) -- let the other workers write their boot ids first
+    while true do
+      local ok, err = pcall(upload_chunk_storage.recover_jobs)
+      if not ok then print("[nyxframe] upload job recovery failed: " .. tostring(err)) end
+      copas.sleep(60)
+    end
+  end)
+end
+
+-- Primary worker only: keeps the fast-disk tier under hot_max_gb (and the
+-- disk itself above hot_min_free_gb) by moving the oldest originals to
+-- uploads_dir. Copy to a temp name, rename into place, then delete the
+-- fast copy -- lookups check the fast tier first, so a file is always
+-- readable from one tier or the other, and a reader that already has the
+-- fast copy open keeps reading it after the delete.
+-- One pass; returns how many files were moved. Must run in a copas thread
+-- (the copies run in the background while it yields).
+function M._hot_tier_pass()
+  local hot = M.settings.hot_dir
+  if not hot or hot == "" then return 0 end
+  local function read_cmd(cmd)
+    local h = io.popen(cmd)
+    if not h then return "" end
+    local out = h:read("*a") or ""
+    h:close()
+    return out
+  end
+  do
+    local used_kb = tonumber(read_cmd("du -sk " .. shell_quote(hot .. "/media") .. " 2>/dev/null"):match("^(%d+)")) or 0
+    local free_kb = tonumber(read_cmd("df -k " .. shell_quote(hot) .. " 2>/dev/null | tail -1"):match("^%S+%s+%d+%s+%d+%s+(%d+)")) or math.huge
+    local max_kb = M.settings.hot_max_gb * 1024 * 1024
+    local min_free_kb = M.settings.hot_min_free_gb * 1024 * 1024
+    if used_kb <= max_kb and free_kb >= min_free_kb then return 0 end
+    -- Move oldest first until 80% of the cap and the free-space floor are met.
+    local target_used = math.floor(max_kb * 0.8)
+    local files = {}
+    for line in read_cmd("find " .. shell_quote(hot .. "/media") .. " -type f ! -name '*.tmp.*' -exec stat -c '%Y %s %n' {} + 2>/dev/null"):gmatch("[^\n]+") do
+      local mtime, size, path = line:match("^(%d+) (%d+) (.+)$")
+      if path then files[#files + 1] = { tonumber(mtime), tonumber(size), path } end
+    end
+    table.sort(files, function(a, b) return a[1] < b[1] end)
+    local moved = 0
+    for _, file in ipairs(files) do
+      if used_kb <= target_used and free_kb >= min_free_kb then break end
+      local rel = file[3]:sub(#hot + 2)
+      local cold = M.settings.uploads_dir .. "/" .. rel
+      local cold_dir = cold:match("^(.*)/[^/]+$")
+      local tmp = cold .. ".tmp." .. tostring(math.random(100000, 999999))
+      local code = os.execute(string.format(
+        "nice -n 19 ionice -c3 sh -c %s",
+        shell_quote(string.format("mkdir -p %s && { [ -f %s ] || { cp -f %s %s && mv -f %s %s; }; }",
+          shell_quote(cold_dir), shell_quote(cold), shell_quote(file[3]), shell_quote(tmp), shell_quote(tmp), shell_quote(cold)))))
+      if code == 0 or code == true then
+        os.remove(file[3])
+        moved = moved + 1
+        used_kb = used_kb - math.floor(file[2] / 1024)
+        free_kb = free_kb + math.floor(file[2] / 1024)
+      else
+        os.remove(tmp)
+        print("[nyxframe] hot tier: could not move " .. rel .. " to the uploads drive")
+        break
+      end
+    end
+    return moved
+  end
+end
+
+function M.start_hot_tier_mover()
+  local hot = M.settings.hot_dir
+  if not hot or hot == "" then return end
+  local copas = require("copas")
+  copas.addthread(function()
+    copas.sleep(120)
+    while true do
+      local ok, moved = pcall(M._hot_tier_pass)
+      if not ok then
+        print("[nyxframe] hot tier mover failed: " .. tostring(moved))
+      elseif moved > 0 then
+        print(string.format("[nyxframe] hot tier: moved %d originals to the uploads drive", moved))
+      end
+      copas.sleep(600)
+    end
+  end)
+end
+
+-- Direct POST /api/media with defer=true: stage the bytes and hand off.
+function M._upload_handoff_bytes(req, user, content, filename, form)
+  local temp_path = upload_chunk_storage.dir() .. "/_upload_direct_" .. sodium.sodium_bin2hex(sodium.randombytes_buf(16)) .. ".part"
+  local f, ferr = io.open(temp_path, "wb")
+  if not f then return 500, { detail = "Could not stage upload: " .. tostring(ferr) } end
+  f:write(content)
+  f:close()
+  local plain_form = {}
+  for k, v in pairs(form or {}) do
+    if type(v) == "string" then plain_form[k] = v end
+  end
+  plain_form.defer = nil
+  upload_chunk_storage.maybe_prune()
+  return upload_chunk_storage.start_job(req, user, temp_path, #content, filename, plain_form)
 end
 
 function M.upload_chunk_init(req)
@@ -4203,8 +4590,7 @@ function M.upload_chunk_init(req)
   local rl_status, rl_body = ratelimit.check("upload:" .. user.id, M.settings.upload_rate_limit_per_hour, 3600)
   if rl_status then return rl_status, rl_body end
 
-  upload_chunk_storage.prune()
-  upload_chunk_storage.job_prune()
+  upload_chunk_storage.maybe_prune()
 
   local json = req.json or {}
   local total_size = tonumber(json.total_size)
@@ -4217,7 +4603,7 @@ function M.upload_chunk_init(req)
   end
 
   local session_id = sodium.sodium_bin2hex(sodium.randombytes_buf(16))
-  local temp_path = M.settings.uploads_dir .. "/_upload_sessions_" .. session_id .. ".part"
+  local temp_path = upload_chunk_storage.dir() .. "/_upload_sessions_" .. session_id .. ".part"
   local f, ferr = io.open(temp_path, "wb")
   if not f then return 500, { detail = "Could not start upload: " .. tostring(ferr) } end
   f:close()
@@ -4237,47 +4623,69 @@ function M.upload_chunk_init(req)
     return 500, { detail = "Could not persist upload session: " .. tostring(save_err) }
   end
 
-  -- BUGFIX 2026-09-14: was 20MB, sized only against the ~100MB Cloudflare
-  -- edge BODY-SIZE ceiling -- a completely separate constraint from the
-  -- one that actually bit this, confirmed live via the new iOS background
-  -- upload path (BackgroundUploadManager): Cloudflare's edge also enforces
-  -- its own ~120s read timeout waiting for the origin to receive+respond
-  -- to a request, independent of body size. A 20MB chunk over a
-  -- *throttled* connection -- exactly what iOS deliberately does to
-  -- background network traffic, and the whole reason a background
-  -- transfer can take meaningfully longer than the same transfer in the
-  -- foreground -- can take well over 120s to arrive, so Cloudflare's edge
-  -- gives up and returns ITS OWN timeout error to the client while this
-  -- backend is still mid-`copas.receive` for the same request; by the time
-  -- this backend finally finishes reading whatever the now-abandoned
-  -- connection actually delivered (confirmed live: ~125s later) and
-  -- responds 400 "Empty chunk"/"Upload is empty", the client is long gone
-  -- and never sees it. 4MB keeps a single chunk's transfer time an order
-  -- of magnitude under that 120s ceiling even under heavy throttling, at
-  -- the cost of more round trips for a given file -- still a suggestion
-  -- the client is free to ignore (chunks are appended in order by index
-  -- regardless of size), not an enforced contract, and applies to both
-  -- clients automatically since both read this value rather than
-  -- hardcoding their own.
-  return 200, { session_id = session_id, chunk_size = 4 * 1024 * 1024 }
+  -- chunk_size stays 4MB for in-order clients: iOS throttles background
+  -- transfers, and Cloudflare drops a request that takes over ~120s, so a
+  -- chunk must stay small enough to arrive well inside that even when
+  -- throttled. Clients that send `offset` (parallel mode) may use any size
+  -- up to max_chunk_size.
+  return 200, {
+    session_id = session_id,
+    chunk_size = 4 * 1024 * 1024,
+    max_chunk_size = upload_chunk_storage.MAX_CHUNK_BYTES,
+    parallel = true,
+  }
 end
 
+-- POST /api/media/upload/chunk?session_id=..&index=N[&offset=B]
+--
+-- With `offset`: the chunk is written at that byte offset, in any order
+-- and from several connections at once; each write is logged to
+-- <part>.log (one short O_APPEND line, safe across worker processes) and
+-- finish checks the logged ranges cover the whole file. Without it: the
+-- original in-order append (iOS), where re-sending the chunk that was
+-- just accepted (a retry after a lost response) is acknowledged instead
+-- of failing with 409.
 function M.upload_chunk_append(req)
   local user, auth, status, body = current_user(req)
   if not user then return status, body end
 
   local session_id = nn(req.query and req.query.session_id)
-  local index = tonumber(req.query and req.query.index)
   local session = session_id and upload_chunk_storage.read(session_id)
   if not session or session.user_id ~= user.id then
     return 404, { detail = "Upload session not found or expired." }
   end
-  if not index or index ~= session.next_index then
-    return 409, { detail = "Chunks must be uploaded in order, starting at 0." }
-  end
   local chunk = req.raw_body or ""
   if chunk == "" then
     return 400, { detail = "Empty chunk." }
+  end
+  if #chunk > upload_chunk_storage.MAX_CHUNK_BYTES then
+    return 413, { detail = "Chunk is too large." }
+  end
+
+  local offset = tonumber(req.query and req.query.offset)
+  if offset then
+    if offset < 0 or offset ~= math.floor(offset) or offset + #chunk > session.total_size then
+      return 400, { detail = "Chunk falls outside the file size declared at upload start." }
+    end
+    local f, ferr = io.open(session.temp_path, "r+b")
+    if not f then return 404, { detail = "Upload session not found or expired." } end
+    f:seek("set", offset)
+    local wrote, werr = f:write(chunk)
+    f:close()
+    if not wrote then return 500, { detail = "Could not write chunk: " .. tostring(werr) } end
+    local log, lerr = io.open(session.temp_path .. ".log", "ab")
+    if not log then return 500, { detail = "Could not record chunk: " .. tostring(lerr) } end
+    log:write(string.format("%d %d\n", offset, #chunk))
+    log:close()
+    return 200, { ok = true }
+  end
+
+  local index = tonumber(req.query and req.query.index)
+  if index and index == session.next_index - 1 and session.last_chunk_bytes == #chunk then
+    return 200, { ok = true, received_bytes = session.received_bytes, duplicate = true }
+  end
+  if not index or index ~= session.next_index then
+    return 409, { detail = "Chunks must be uploaded in order, starting at 0." }
   end
   if session.received_bytes + #chunk > session.total_size then
     pcall(os.remove, session.temp_path)
@@ -4292,6 +4700,7 @@ function M.upload_chunk_append(req)
 
   session.received_bytes = session.received_bytes + #chunk
   session.next_index = session.next_index + 1
+  session.last_chunk_bytes = #chunk
   local saved, save_err = upload_chunk_storage.write(session_id, session)
   if not saved then
     return 500, { detail = "Could not persist upload progress: " .. tostring(save_err) }
@@ -4309,191 +4718,57 @@ function M.upload_chunk_finish(req)
   if not session or session.user_id ~= user.id then
     return 404, { detail = "Upload session not found or expired." }
   end
-  if session.received_bytes ~= session.total_size then
-    return 400, { detail = "Upload is incomplete: expected " .. session.total_size .. " bytes, received " .. session.received_bytes .. "." }
-  end
-
   local temp_path = session.temp_path
   local total_size = session.total_size
-  upload_chunk_storage.remove(session_id)
-
   if not total_size or total_size == 0 then
     pcall(os.remove, temp_path)
+    upload_chunk_storage.remove(session_id)
     return 400, { detail = "Upload is empty." }
   end
 
-  -- req.json fields double as the "form" here since chunk sessions carry
-  -- metadata as JSON, not multipart -- form_bool/nn etc all just expect
-  -- string-ish values, and cjson already decodes true/false as Lua
-  -- booleans, so coerce back to the "true"/"false" strings those helpers
-  -- expect from a real multipart form field.
-  local pseudo_form = {}
+  -- Incomplete uploads keep their session, so the client can send what's
+  -- missing (missing_from) and call finish again.
+  local log = io.open(temp_path .. ".log", "rb")
+  if log then
+    local ranges = {}
+    for line in log:lines() do
+      local o, l = line:match("^(%d+) (%d+)$")
+      if o then ranges[#ranges + 1] = { tonumber(o), tonumber(l) } end
+    end
+    log:close()
+    table.sort(ranges, function(a, b) return a[1] < b[1] end)
+    local covered = 0
+    for _, r in ipairs(ranges) do
+      if r[1] > covered then break end
+      if r[1] + r[2] > covered then covered = r[1] + r[2] end
+    end
+    if covered < total_size then
+      return 400, { detail = string.format("Upload is incomplete: missing data from byte %d of %d.", covered, total_size), missing_from = covered }
+    end
+    os.remove(temp_path .. ".log")
+  elseif session.received_bytes ~= total_size then
+    return 400, { detail = "Upload is incomplete: expected " .. total_size .. " bytes, received " .. session.received_bytes .. "." }
+  end
+  upload_chunk_storage.remove(session_id)
+
+  -- Session metadata arrives as JSON; finalize_upload's helpers expect the
+  -- string values a multipart form would give, so coerce booleans/arrays.
+  local plain_form = {}
   for k, v in pairs(form) do
     if type(v) == "boolean" then
-      pseudo_form[k] = v and "true" or "false"
+      plain_form[k] = v and "true" or "false"
     elseif type(v) == "table" then
-      pseudo_form[k] = cjson.encode(v)
-    else
-      pseudo_form[k] = v
+      plain_form[k] = cjson.encode(v)
+    elseif v ~= cjson.null then
+      plain_form[k] = tostring(v)
     end
   end
-
-  -- Fast dry run before handing the slow part off to a background thread:
-  -- finalize_upload's own real work here (fast-start remux, a full-file
-  -- sha256 hash, an up-to-30s AI vision call, the disk save) is what made
-  -- this request take 60-90s+ end to end, forcing the uploader to sit on
-  -- the page. Everything checked below is cheap -- a 512-byte magic-byte
-  -- sniff of bytes already fully assembled on disk, plus pure form-field
-  -- validation -- so it catches the realistic "user made an obvious
-  -- mistake" cases (wrong file type, bad visibility value, unparseable
-  -- publish date, missing title/category with AI auto-fill off) with the
-  -- client still on the page to see the error, exactly like the old
-  -- synchronous path did. Title/category left blank WITH auto-fill on is
-  -- deliberately NOT validated here -- whether that resolves depends on
-  -- the AI call, which is itself part of the slow work being deferred; if
-  -- it doesn't resolve, that surfaces as a job error on poll instead.
-  local prefix = ""
-  do
-    local f = io.open(temp_path, "rb")
-    if f then
-      prefix = f:read(512) or ""
-      f:close()
-    end
-  end
-  local sniffed_mime = sniff_magic(prefix)
-  if not sniffed_mime then
-    pcall(os.remove, temp_path)
-    return 400, { detail = "Unsupported or invalid file bytes." }
-  end
-  if not safe_extension(session.filename, sniffed_mime) then
-    pcall(os.remove, temp_path)
-    return 400, { detail = "Unsupported file extension." }
-  end
-  local visibility = (nn(pseudo_form.visibility) or "public"):lower()
-  if visibility ~= "public" and visibility ~= "unlisted" and visibility ~= "private" then
-    pcall(os.remove, temp_path)
-    return 400, { detail = "Visibility must be public, unlisted, or private." }
-  end
-  local _, publish_at_err = parse_publish_at(pseudo_form.publish_at)
-  if publish_at_err then
-    pcall(os.remove, temp_path)
-    return 400, { detail = publish_at_err }
-  end
-  local auto_ai = form_bool(pseudo_form.auto_ai, true)
-  if trim(nn(pseudo_form.title) or "") == "" and not auto_ai then
-    pcall(os.remove, temp_path)
-    return 400, { detail = "Title is required." }
-  end
-  local category_id_check = tonumber(pseudo_form.category_id)
-  local has_category_name = nn(pseudo_form.category_name) and trim(pseudo_form.category_name) ~= ""
-  if not (category_id_check and category_id_check > 0) and not has_category_name and not auto_ai then
-    pcall(os.remove, temp_path)
-    return 400, { detail = "Category is required." }
-  end
-
-  if upload_chunk_storage.active_finalize_jobs >= upload_chunk_storage.FINALIZE_MAX_CONCURRENT then
-    pcall(os.remove, temp_path)
-    return 503, { detail = "This server is busy processing other uploads right now -- please try again in a few seconds." }, { ["Retry-After"] = "5" }
-  end
-  upload_chunk_storage.active_finalize_jobs = upload_chunk_storage.active_finalize_jobs + 1
-
-  local job_id = sodium.sodium_bin2hex(sodium.randombytes_buf(16))
-  upload_chunk_storage.job_write(job_id, { user_id = user.id, status = "processing", created_at = os.time() })
-
-  local copas = require("copas")
-
-  -- copas.addthread doesn't parallelize the actual ffmpeg/hash work (see
-  -- fast_start_remux_if_needed's os.execute -- that's a plain blocking
-  -- syscall with no cooperative yield point, so this worker is just as
-  -- busy during it as before); what changes is that the CLIENT'S request
-  -- returns immediately instead of being held open for however long that
-  -- takes, so the browser tab is free the moment the fast checks above
-  -- pass. `req` is safe to close over here -- it's a plain table (method/
-  -- path/query/headers/etc), not the live socket, so referencing it after
-  -- this handler's own response has already gone out is fine.
-  --
-  -- Auto-retries a failed attempt up to UPLOAD_RETRY_MAX_ATTEMPTS times
-  -- total before giving up, entirely within this one coroutine: attempt
-  -- N+1 only ever starts after attempt N's pcall has fully returned and its
-  -- failure is already durably written to the job file, so there is no
-  -- window where two attempts for the same job could both be in flight (the
-  -- scenario that would risk a duplicate media_items row). Only retries
-  -- failures that look transient -- an unexpected Lua error, or a 5xx from
-  -- finalize_upload itself -- never a 4xx (bad title, unsupported file
-  -- type, ...), since that's a deterministic rejection a byte-for-byte
-  -- identical retry would just reproduce 3 times for nothing. Also stops
-  -- immediately if temp_path no longer exists: finalize_upload's own
-  -- media_files.save_media_file_to_disk os.rename()s it into permanent
-  -- storage BEFORE the DB insert that can actually fail, so a missing
-  -- temp_path means a retry can't safely replay from scratch anyway (it
-  -- would misread as "unsupported file bytes" instead of the real error) --
-  -- and, since that rename only happens once real progress has been made,
-  -- it's also the signal that this attempt got far enough that blindly
-  -- re-running it would risk exactly the duplicate insert this exists to
-  -- prevent.
-  copas.addthread(function()
-    local UPLOAD_RETRY_MAX_ATTEMPTS = 3
-    local UPLOAD_RETRY_BACKOFF_SECONDS = { 3, 10 }
-    local attempt = 1
-    while true do
-      local telemetry_t0 = M.telemetry.now()
-      local ok, status_code, resp_body = pcall(
-        finalize_upload, req, user, { file_path = temp_path, file_size = total_size }, session.filename, pseudo_form
-      )
-      local telemetry_duration_ms = M.telemetry.ms_since(telemetry_t0)
-
-      if ok and status_code == 200 then
-        M.telemetry.record("upload", "chunked", "success", telemetry_duration_ms,
-          { bytes = total_size, media_id = resp_body and resp_body.media and resp_body.media.id or nil, attempts = attempt })
-        upload_chunk_storage.job_write(job_id, { user_id = user.id, status = "done", created_at = os.time(), response = resp_body, attempts = attempt })
-        pcall(os.remove, temp_path)
-        upload_chunk_storage.active_finalize_jobs = upload_chunk_storage.active_finalize_jobs - 1
-        return
-      end
-
-      local detail = ok and ((resp_body and resp_body.detail) or "Upload failed.") or tostring(status_code)
-      if not ok then
-        print("[nyxframe] background upload finish error (job " .. job_id .. ", attempt " .. attempt .. "): " .. detail)
-      end
-      M.telemetry.record("upload", "chunked", "error", telemetry_duration_ms,
-        { bytes = total_size, status = ok and status_code or nil, detail = detail:sub(1, 300), attempt = attempt })
-
-      local retryable = (not ok) or (type(status_code) == "number" and status_code >= 500)
-      local source_still_present = io.open(temp_path, "rb")
-      if source_still_present then source_still_present:close() end
-
-      if not retryable or not source_still_present or attempt >= UPLOAD_RETRY_MAX_ATTEMPTS then
-        upload_chunk_storage.job_write(job_id, {
-          user_id = user.id, status = "error", created_at = os.time(),
-          detail = ok and detail or "Upload processing failed unexpectedly.",
-          attempts = attempt,
-        })
-        pcall(os.remove, temp_path)
-        upload_chunk_storage.active_finalize_jobs = upload_chunk_storage.active_finalize_jobs - 1
-        return
-      end
-
-      -- Durably mark this attempt as failed (retrying=true) before sleeping
-      -- -- a poll landing in this window sees a finished failure, never a
-      -- stale "processing" that would otherwise look stuck. copas.sleep
-      -- yields this worker to other requests for the backoff duration.
-      upload_chunk_storage.job_write(job_id, {
-        user_id = user.id, status = "error", created_at = os.time(),
-        detail = detail, attempts = attempt, retrying = true,
-      })
-      copas.sleep(UPLOAD_RETRY_BACKOFF_SECONDS[attempt] or UPLOAD_RETRY_BACKOFF_SECONDS[#UPLOAD_RETRY_BACKOFF_SECONDS])
-      attempt = attempt + 1
-    end
-  end)
-
-  return 202, { status = "processing", job_id = job_id }
+  return upload_chunk_storage.start_job(req, user, temp_path, total_size, session.filename, plain_form)
 end
 
--- GET /api/media/upload/job/:job_id -- lets the client, having gotten a 202
--- back from upload_chunk_finish above and moved on to another page, poll
--- for that background job's outcome (or just abandon it -- the notify/
--- saved-search side effects inside finalize_upload already fired
--- regardless of whether anyone's still watching).
+-- GET /api/media/upload/job/:job_id -- outcome of a background job (see
+-- start_job). While running it also reports `stage` (queued, starting,
+-- optimizing, analyzing, fingerprinting, saving, finishing) for progress UI.
 function M.upload_job_status(req)
   local user, auth, status, body = current_user(req)
   if not user then return status, body end
@@ -4508,25 +4783,9 @@ function M.upload_job_status(req)
     local r = job.response or {}
     local media = r.media
     if media then
-      -- job.response was round-tripped through cjson.encode/decode via
-      -- job_write/job_read (disk-persisted so a poll after a worker
-      -- restart can still find it) -- arr()'s cjson.empty_array sentinel
-      -- (used by decode_media_row/attach_media_subcategories to force an
-      -- EMPTY list to encode as `[]` instead of cjson's default `{}` for
-      -- an ambiguous empty table) does not survive that round trip: cjson
-      -- decodes `[]` back into a plain Lua `{}`, indistinguishable from an
-      -- empty object once re-encoded here. Every array-shaped media field
-      -- that happened to be empty (a fresh upload with no subcategories,
-      -- for instance) silently flipped from `[]` to `{}` in this response
-      -- -- harmless to web's untyped JSON handling but a hard decode
-      -- failure for iOS's strict Codable models (confirmed live:
-      -- "Expected value of type Array<Any>... found a dictionary instead"
-      -- at media.subcategoryNames, surfaced only once large images started
-      -- actually reaching this job-polling path). Re-arr() every such
-      -- field here -- the one spot a media object gets serialized a
-      -- second time after a JSON round trip. arr() is idempotent on an
-      -- already-correct non-empty array, so this is safe regardless of
-      -- whether the round trip actually lost anything for a given field.
+      -- The response went through a cjson encode/decode round trip on
+      -- disk, which turns empty arrays into empty objects; iOS's strict
+      -- Codable models reject that, so re-mark every array field.
       media.tags = arr(media.tags)
       media.subcategories = arr(media.subcategories)
       media.subcategory_ids = arr(media.subcategory_ids)
@@ -4534,13 +4793,11 @@ function M.upload_job_status(req)
     end
     return 200, { status = "done", media = media, possible_duplicates = arr(r.possible_duplicates), possible_site_duplicates = arr(r.possible_site_duplicates) }
   elseif job.status == "error" then
-    -- retrying=true means this is an in-flight attempt's failure, not the
-    -- final outcome -- upload_chunk_finish's background thread is about to
-    -- try again (see its own header comment). Surfaced to the client so a
-    -- poll landing in that window doesn't treat it as terminal.
+    -- retrying=true: a failed attempt that is about to be retried, not the
+    -- final outcome.
     return 200, { status = "error", detail = job.detail or "Upload failed.", retrying = job.retrying or false, attempts = job.attempts }
   end
-  return 200, { status = "processing" }
+  return 200, { status = "processing", stage = job.stage or "queued", queued = job.status == "queued" }
 end
 
 -- Standalone "preview the AI suggestion before uploading" endpoint. Mirrors
@@ -7655,8 +7912,12 @@ fast_start_remux_if_needed = function(source, sniffed_mime)
     return source
   end
 
+  -- Scratch space: the upload staging dir (fast-disk tier when configured,
+  -- see config.lua's hot_dir), so the remux reads and writes there instead
+  -- of on the slow USB drive.
   local function faststart_tmp_path(suffix)
-    local dir = M.settings.uploads_dir .. "/_upload_tmp"
+    local hot = M.settings.hot_dir
+    local dir = (hot and hot ~= "") and (hot .. "/staging") or (M.settings.uploads_dir .. "/_upload_tmp")
     os.execute("mkdir -p " .. shell_quote(dir))
     return dir .. "/faststart_" .. tostring(math.random(100000000, 999999999)) .. suffix
   end
@@ -7669,6 +7930,13 @@ fast_start_remux_if_needed = function(source, sniffed_mime)
     f:write(source.content)
     f:close()
     own_input = true
+  end
+
+  -- Already faststart (moov before mdat -- most phone exports and anything
+  -- previously run through this): nothing to fix, skip copying the file.
+  if media_files.mp4_is_faststart(input_path) == true then
+    if own_input then os.remove(input_path) end
+    return source
   end
 
   local output_path = faststart_tmp_path(".out")
@@ -8873,13 +9141,20 @@ prewarm_video_thumb = function(media_id, item)
     local out = io.open(marker, "wb")
     if out then out:write(tostring(os.time())); out:close() end
 
-    local content = resolve_media_bytes(item)
-    if not content then
-      os.remove(marker)
-      os.execute("rm -f " .. shell_quote(slot_path))
-      return
+    -- ffmpeg reads the stored file directly. (This used to load the whole
+    -- video into Lua memory via resolve_media_bytes and write a second
+    -- full copy to _original_cache just to grab one frame -- hundreds of
+    -- MB of GC heap and disk writes per upload.)
+    local src_path = M._image_source_path(item)
+    if not src_path then
+      local content = resolve_media_bytes(item)
+      if not content then
+        os.remove(marker)
+        os.execute("rm -f " .. shell_quote(slot_path))
+        return
+      end
+      src_path = original_bytes_cache_path(media_id, item)
     end
-    local src_path = original_bytes_cache_path(media_id, item)
     local tmp_dst = cache_path .. ".tmp.webp"
     local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, width, 84, 0.35)
     os.execute(string.format(
@@ -12268,16 +12543,21 @@ function M.start_deleted_media_purge()
         if storage_path then
           local still_referenced = db.fetchone("SELECT id FROM media_items WHERE storage_path=%s LIMIT 1", storage_path)
           if not still_referenced then
-            local full_path = M.settings.uploads_dir .. "/" .. storage_path
-            local size = 0
-            local f = io.open(full_path, "rb")
-            if f then
-              size = f:seek("end") or 0
-              f:close()
-            end
-            if os.remove(full_path) then
-              removed_files = removed_files + 1
-              freed_bytes = freed_bytes + size
+            -- Either storage tier may hold it (see config.lua's hot_dir).
+            local roots = { M.settings.uploads_dir }
+            if media_files.hot_root then roots[#roots + 1] = media_files.hot_root end
+            for _, root in ipairs(roots) do
+              local full_path = root .. "/" .. storage_path
+              local size = 0
+              local f = io.open(full_path, "rb")
+              if f then
+                size = f:seek("end") or 0
+                f:close()
+              end
+              if os.remove(full_path) then
+                removed_files = removed_files + 1
+                freed_bytes = freed_bytes + size
+              end
             end
           end
         end

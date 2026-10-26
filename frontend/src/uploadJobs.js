@@ -33,3 +33,20 @@ export function addPendingUploadJob({ jobId, filename }) {
 export function removePendingUploadJob(jobId) {
   writePendingUploadJobs(getPendingUploadJobs().filter((job) => job.jobId !== jobId));
 }
+
+// Human-readable text for a background upload job's `stage` (see
+// upload_job_status in routes.lua).
+const STAGE_TEXT = {
+  queued: "Waiting for a free processing slot…",
+  starting: "Processing…",
+  optimizing: "Optimizing video for streaming…",
+  analyzing: "Filling in title and tags with AI…",
+  fingerprinting: "Checking for duplicates…",
+  saving: "Saving…",
+  finishing: "Almost done…",
+  retrying: "Hit a snag — retrying…",
+};
+
+export function describeUploadStage(stage) {
+  return STAGE_TEXT[stage] || "Processing…";
+}

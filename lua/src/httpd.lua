@@ -139,33 +139,33 @@ end
 -- _read_validated_upload_streamed does; fine for this deployment's traffic
 -- level, revisit if very large uploads become common.
 local function parse_multipart(body, boundary)
+  -- Index-based: each field's bytes are copied out of `body` exactly once
+  -- (the old version made four full copies of every file part -- part,
+  -- leading-CRLF strip, content, trailing-CRLF strip -- which for an 80MB
+  -- upload meant ~320MB of garbage and a long stop-the-world GC).
   local form, files = {}, {}
   local delim = "--" .. boundary
-  local pos = 1
-  local parts = {}
-  while true do
-    local s, e = body:find(delim, pos, true)
-    if not s then break end
+  local _, e = body:find(delim, 1, true)
+  while e do
     local next_s = body:find(delim, e + 1, true)
     if not next_s then break end
-    parts[#parts + 1] = body:sub(e + 1, next_s - 1)
-    pos = next_s
-  end
-  for _, part in ipairs(parts) do
-    part = part:gsub("^\r\n", "")
-    local header_end = part:find("\r\n\r\n", 1, true)
-    if header_end then
-      local header_block = part:sub(1, header_end - 1)
-      local content = part:sub(header_end + 4):gsub("\r\n$", "")
+    local ps = e + 1
+    if body:sub(ps, ps + 1) == "\r\n" then ps = ps + 2 end
+    local header_end = body:find("\r\n\r\n", ps, true)
+    if header_end and header_end < next_s then
+      local header_block = body:sub(ps, header_end - 1)
+      local cs, ce = header_end + 4, next_s - 1
+      if ce - cs >= 1 and body:sub(ce - 1, ce) == "\r\n" then ce = ce - 2 end
       local name = header_block:match('name="([^"]*)"')
       local filename = header_block:match('filename="([^"]*)"')
       local content_type = header_block:match("[Cc]ontent%-[Tt]ype:%s*([^\r\n]+)")
       if name and filename ~= nil then
-        files[name] = { filename = filename, content_type = content_type, content = content }
+        files[name] = { filename = filename, content_type = content_type, content = body:sub(cs, ce) }
       elseif name then
-        form[name] = content
+        form[name] = body:sub(cs, ce)
       end
     end
+    e = next_s + #delim - 1
   end
   return form, files
 end
