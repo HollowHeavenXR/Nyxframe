@@ -21,6 +21,14 @@ if [ "$N" -le 1 ]; then
   exec luajit main.lua
 fi
 
+# A container (re)start kills every ffmpeg, so transcode claims and
+# "render in progress" markers left on disk are all stale. Left alone they
+# blocked video playback ("server is busy transcoding") for up to 30 min
+# after every deploy. Cleared here, before any worker can make new ones.
+UP=${GALLERY_UPLOADS_DIR:-../uploads}
+rm -f "$UP"/_transcode_slots/* "$UP"/_hls_cache/*.pending "$UP"/_video_cache/*.pending 2>/dev/null
+find "$UP/_thumb_cache" "$UP/_preview_cache" -maxdepth 2 -name '*.pending' -delete 2>/dev/null
+
 backends=""
 i=0
 while [ "$i" -lt "$N" ]; do

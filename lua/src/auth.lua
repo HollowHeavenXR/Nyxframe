@@ -101,8 +101,20 @@ end
 
 -- PBKDF2-HMAC-SHA256(password, salt, iterations, dklen) — matches Python's
 -- hashlib.pbkdf2_hmac("sha256", password, salt, iterations) byte-for-byte.
+-- OpenSSL's native PBKDF2 (luaossl) when available: same bytes, but ~17x
+-- faster (140ms vs 2.4s for the 260k-iteration login check). This runs on
+-- the request's worker without yielding, so the Lua loop below froze every
+-- other request on that worker for 2.5-5s per login/sign-up.
+local ossl_kdf_ok, ossl_kdf = pcall(require, "openssl.kdf")
+
 function M.pbkdf2_hmac_sha256(password, salt, iterations, dklen)
   dklen = dklen or 32
+  if ossl_kdf_ok then
+    local ok, out = pcall(ossl_kdf.derive, {
+      type = "PBKDF2", md = "sha256", pass = password, salt = salt, iter = iterations, outlen = dklen,
+    })
+    if ok and type(out) == "string" and #out == dklen then return out end
+  end
   local hlen = 32
   local blocks_needed = math.ceil(dklen / hlen)
   local dk_parts = {}

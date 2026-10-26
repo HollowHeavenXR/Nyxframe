@@ -98,6 +98,12 @@ function M.install(opts)
       or c:find("curl", 1, true) or c:find("find ", 1, true) or c:find("tar ", 1, true) then
       return false
     end
+    -- Recursive deletes, copies and chained commands can move a lot of
+    -- data (one `rm -rf` of an HLS dir on the USB drive held a worker for
+    -- 15s), so only plain single-file one-liners run inline.
+    if c:find(" -r", 1, true) or c:find("||", 1, true) or c:find("&&", 1, true) or c:match("^cp ") then
+      return false
+    end
     return c:match("^mkdir ") or c:match("^rm ") or c:match("^mv ") or c:match("^touch ")
       or c:match("^test ") or c:match("^%[ ") or c:match("^stat ") or c:match("^ln ") or c:match("^cp ")
   end
@@ -115,7 +121,9 @@ function M.install(opts)
   local function execute_yielding(cmd, opts)
     copas = copas or require("copas")
     local capped = not (opts and opts.uncapped)
-    while capped and running >= max_running do copas.sleep(0.05) end
+    while capped and running >= max_running do
+      if not pcall(copas.sleep, 0.05) then require("socket").sleep(0.05) end
+    end
     if capped then running = running + 1 end
     local marker = os.tmpname()
     os.remove(marker)
@@ -136,7 +144,9 @@ function M.install(opts)
         os.remove(marker)
         break
       end
-      copas.sleep(delay)
+      -- A caller inside a C boundary (an iterator, a gsub callback) can't
+      -- yield: wait without yielding instead of failing the request.
+      if not pcall(copas.sleep, delay) then require("socket").sleep(delay) end
       if delay < 0.05 then delay = delay * 2 end
     end
     if capped then running = running - 1 end

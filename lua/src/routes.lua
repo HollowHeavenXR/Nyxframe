@@ -4077,7 +4077,7 @@ function M.upload_media(req)
     return 400, { detail = "Upload is empty." }
   end
   if #upload.content > M.settings.max_upload_bytes then
-    return 413, { detail = string.format("Uploads must be %dMB or smaller.", math.floor(M.settings.max_upload_bytes / (1024 * 1024))) }
+    return 413, { detail = "Uploads must be " .. M._upload_limit_label() .. " or smaller." }
   end
 
   local rl_status, rl_body = ratelimit.check("upload:" .. user.id, M.settings.upload_rate_limit_per_hour, 3600)
@@ -4567,6 +4567,30 @@ function M.start_hot_tier_mover()
   end)
 end
 
+-- "2 GB" / "700 MB" for limit messages.
+function M._upload_limit_label()
+  local bytes = M.settings.max_upload_bytes
+  local gb = bytes / (1024 * 1024 * 1024)
+  if gb >= 1 then
+    return (gb == math.floor(gb) and string.format("%d GB", gb) or string.format("%.1f GB", gb))
+  end
+  return string.format("%d MB", math.floor(bytes / (1024 * 1024)))
+end
+
+-- Free space (KB) where uploads are staged; cached for 10s (df is a
+-- subprocess, and init can be called many times in a batch).
+function upload_chunk_storage.free_kb()
+  local now = os.time()
+  local cache = upload_chunk_storage.free_cache
+  if cache and now - cache.at < 10 then return cache.kb end
+  local h = io.popen("df -k " .. shell_quote(upload_chunk_storage.dir()) .. " 2>/dev/null | tail -1")
+  local line = h and h:read("*a") or ""
+  if h then h:close() end
+  local kb = tonumber(line:match("^%S+%s+%d+%s+%d+%s+(%d+)"))
+  upload_chunk_storage.free_cache = { at = now, kb = kb }
+  return kb
+end
+
 -- Direct POST /api/media with defer=true: stage the bytes and hand off.
 function M._upload_handoff_bytes(req, user, content, filename, form)
   local temp_path = upload_chunk_storage.dir() .. "/_upload_direct_" .. sodium.sodium_bin2hex(sodium.randombytes_buf(16)) .. ".part"
@@ -4599,7 +4623,14 @@ function M.upload_chunk_init(req)
     return 400, { detail = "total_size is required." }
   end
   if total_size > M.settings.max_upload_bytes then
-    return 413, { detail = string.format("Uploads must be %dMB or smaller.", math.floor(M.settings.max_upload_bytes / (1024 * 1024))) }
+    return 413, { detail = "Uploads must be " .. M._upload_limit_label() .. " or smaller." }
+  end
+
+  -- Room for the file, a remuxed copy of it, and 2GB to spare -- refuse
+  -- up front rather than fail after the whole thing has been sent.
+  local free_kb = upload_chunk_storage.free_kb()
+  if free_kb and free_kb * 1024 < total_size * 2 + 2 * 1024 * 1024 * 1024 then
+    return 507, { detail = "The server is low on storage space right now. Please try again later or upload a smaller file." }
   end
 
   local session_id = sodium.sodium_bin2hex(sodium.randombytes_buf(16))
@@ -4814,7 +4845,7 @@ function M.analyze_media(req)
     return 400, { detail = "Upload is empty." }
   end
   if #upload.content > M.settings.max_upload_bytes then
-    return 413, { detail = string.format("Uploads must be %dMB or smaller.", math.floor(M.settings.max_upload_bytes / (1024 * 1024))) }
+    return 413, { detail = "Uploads must be " .. M._upload_limit_label() .. " or smaller." }
   end
 
   local rl_status, rl_body = ratelimit.check("analyze:" .. user.id, M.settings.analyze_rate_limit_per_hour, 3600)
@@ -7941,12 +7972,28 @@ fast_start_remux_if_needed = function(source, sniffed_mime)
 
   local output_path = faststart_tmp_path(".out")
   local container = sniffed_mime == "video/quicktime" and "mov" or "mp4"
-  local cmd = string.format(
-    "nice -n 15 ionice -c2 -n6 %s -y -hide_banner -loglevel error -i %s -map 0:v:0 -map 0:a:0? "
-      .. "-c copy -movflags +faststart -f %s %s >/dev/null 2>&1",
-    ffmpeg_bin(), shell_quote(input_path), container, shell_quote(output_path)
-  )
-  local exit = os.execute(cmd)
+  local function remux(flags)
+    return os.execute(string.format(
+      "nice -n 15 ionice -c2 -n6 %s -y -hide_banner -loglevel error -i %s -map 0:v:0 -map 0:a:0? "
+        .. "-c copy %s -f %s %s >/dev/null 2>&1",
+      ffmpeg_bin(), shell_quote(input_path), flags, container, shell_quote(output_path)
+    ))
+  end
+  -- One pass: reserve room for the index at the front (sized from the
+  -- source's own moov plus margin) so ffmpeg writes it there directly.
+  -- +faststart instead writes the file and then rewrites all of it to move
+  -- the index forward -- 18s vs 12s for a 1.9GB video. If the reservation
+  -- turns out too small ffmpeg fails, and the two-pass way runs instead.
+  local layout = media_files.mp4_layout(input_path)
+  local exit
+  if layout and layout.moov_size then
+    exit = remux("-moov_size " .. tostring(math.floor(layout.moov_size * 1.05) + 65536))
+    if not (exit == 0 or exit == true) or media_files.mp4_is_faststart(output_path) ~= true then
+      os.remove(output_path)
+      exit = nil
+    end
+  end
+  if exit == nil then exit = remux("-movflags +faststart") end
   -- LuaJIT's os.execute returns the raw exit status (0 == success); the
   -- 5.2+ semantics some rocks emulate return (true, "exit", 0) instead --
   -- normalize both rather than assume one.
@@ -10379,8 +10426,14 @@ local function ensure_hls_variant(media_id, item, content_fn, quality, opts)
     if probe then
       probe:close()
       local q_src, q_dst = shell_quote(opts.source_path), shell_quote(src)
+      -- Symlink before cp: since 2026-10-26 new originals live on the
+      -- fast-disk tier (config.lua's hot_dir) while _hls_cache is on the
+      -- USB drive, so the hardlink fails across filesystems and cp would
+      -- copy the whole video onto the slowest disk. source.bin is only
+      -- read while the encode runs (the job removes it afterwards).
       local rc = os.execute(string.format(
-        "ln -f %s %s 2>/dev/null || cp -f %s %s 2>/dev/null", q_src, q_dst, q_src, q_dst))
+        "ln -f %s %s 2>/dev/null || ln -sf %s %s 2>/dev/null || nice -n 10 cp -f %s %s 2>/dev/null",
+        q_src, q_dst, q_src, q_dst, q_src, q_dst))
       linked = (rc == 0 or rc == true)
     end
   end
@@ -10409,11 +10462,16 @@ local function ensure_hls_variant(media_id, item, content_fn, quality, opts)
   -- only -- never on a cache hit.
   local source_bitrate_bps
   do
-    local probe = io.popen(string.format(
-      "%s -v error -show_entries format=duration,bit_rate -of csv=p=0 %s 2>/dev/null",
-      ffprobe_bin(), shell_quote(src)))
-    local out = probe and probe:read("*a") or ""
-    if probe then probe:close() end
+    -- Via os.execute into a file (not io.popen) so blockwatch runs it in
+    -- the background: on the USB drive this probe held a worker 0.65s+.
+    local probe_out = dir .. "/.probe"
+    os.execute(string.format(
+      "%s -v error -show_entries format=duration,bit_rate -of csv=p=0 %s > %s 2>/dev/null",
+      ffprobe_bin(), shell_quote(src), shell_quote(probe_out)))
+    local pf = io.open(probe_out, "rb")
+    local out = pf and pf:read("*a") or ""
+    if pf then pf:close() end
+    os.remove(probe_out)
     -- `-of csv=p=0` on format=duration,bit_rate emits one "duration,bitrate"
     -- line; either field can be "N/A" on an odd container, hence the
     -- tolerant per-field match rather than positional parsing.
@@ -10856,7 +10914,9 @@ transcode.warmer.try_launch = function(item, quality)
     -- Lets ensure_hls_variant hardlink the original instead of reading the
     -- whole video through memory; see its own comment there. nil-safe: an
     -- item whose original is not on disk yet just takes the old path.
-    source_path = original_bytes_cache_path(item.id, item),
+    -- The stored original itself (fast-disk tier or uploads drive), else
+    -- the _original_cache copy -- see M._image_source_path.
+    source_path = M._image_source_path(item),
   })
   return "launched"
 end
@@ -11630,7 +11690,7 @@ function M.serve_hls_playlist(req)
   end
 
   local dir, err = ensure_hls_variant(media_id, item, function() return resolve_media_bytes(item) end, quality, {
-    source_path = original_bytes_cache_path(media_id, item),
+    source_path = M._image_source_path(item),
   })
   if not dir then
     if err == "missing" then return 404, { detail = "File is missing." } end

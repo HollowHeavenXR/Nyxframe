@@ -1,5 +1,5 @@
 export const PAGE_SIZE = 24;
-export const FALLBACK_MAX_UPLOAD_BYTES = 700 * 1024 * 1024;
+export const FALLBACK_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 export let MAX_UPLOAD_BYTES = FALLBACK_MAX_UPLOAD_BYTES;
 
 export function setRuntimeMaxUploadBytes(value) {
