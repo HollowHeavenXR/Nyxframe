@@ -465,8 +465,13 @@ local function serve_one_request(sock, start_time)
   local ok, result = pcall(function()
     local first_line, headers = read_headers(sock)
     if not first_line then return false end
+    -- Time from the request's arrival, not from when this kept-alive
+    -- connection started waiting for it (that idle gap used to be counted
+    -- as request time in the access log and route telemetry).
+    start_time = socket.gettime()
     local method, path_and_query, version = first_line:match("^(%u+)%s+(%S+)%s+HTTP/(%d%.%d)")
     log_method = method or "?"
+    if method then require("blockwatch").label(coroutine.running(), method .. " " .. path_and_query) end
     if not method then
       respond(400, "Bad Request", {}, cjson.encode({ detail = "Malformed request line" }))
       return false
@@ -648,7 +653,16 @@ end
 -- tying up a coroutine indefinitely, now that a connection's lifetime is no
 -- longer bounded by "exactly one request".
 local function handle_connection(sock)
-  sock:settimeout(KEEP_ALIVE_IDLE_SECONDS)
+  -- BUGFIX 2026-10-26: this used to be sock:settimeout(KEEP_ALIVE_IDLE_SECONDS)
+  -- on the raw socket, which makes it a BLOCKING socket again -- copas needs
+  -- it at 0. Every kept-alive connection then froze the whole worker inside
+  -- recv() while it waited for the client's next request (up to the full 15s
+  -- idle timeout). Cloudflare's tunnel always reuses connections, so this
+  -- was the 5-40s "site loads slowly" stall on nearly every page. The idle
+  -- timeout now lives in copas (read side only, so a long download to a slow
+  -- client isn't cut off).
+  sock:settimeout(0)
+  copas.settimeouts(sock, nil, nil, KEEP_ALIVE_IDLE_SECONDS)
   while true do
     local start_time = socket.gettime()
     local keep_alive = serve_one_request(sock, start_time)

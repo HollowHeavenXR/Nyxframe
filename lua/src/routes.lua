@@ -894,6 +894,30 @@ local function append_query(url, key, value)
   return url .. sep .. key .. "=" .. value
 end
 
+-- Cache-busting thumb_url builder. The thumb endpoint sends
+-- "Cache-Control: public, max-age=604800, immutable" (see M.serve_media_thumb)
+-- -- great for the normal case (a thumbnail essentially never changes after
+-- its first render) but it means a browser that already fetched a given
+-- media_id's thumb URL will NEVER ask the server again for a week, even if
+-- the cached file on disk is later regenerated (an admin repair script, a
+-- YouTube-source-link backfill, etc.). Appending a `v` token derived from
+-- updated_at -- same "cheap existing column as a version stamp" idiom
+-- original_bytes_cache_path already uses for its own cache key (see that
+-- function's header comment) -- changes the URL whenever updated_at changes,
+-- so a forced re-render is automatically visible to every client without
+-- needing a CDN purge or anyone hard-refreshing. Routine first-time renders
+-- don't need this (the URL is new to the client either way), so nothing
+-- needs to bump updated_at on every normal upload/view -- only an explicit
+-- repair path (see scripts/backfill_youtube_thumbnails.lua) needs to.
+function M.thumb_url_for(origin, media_id, media_kind, updated_at)
+  if media_kind ~= "image" and media_kind ~= "video" then return nil end
+  local url = append_query(origin .. "/api/media/" .. media_id .. "/thumb", "w", "640")
+  if updated_at and updated_at ~= cjson.null then
+    url = append_query(url, "v", tostring(updated_at):gsub("%D", ""))
+  end
+  return url
+end
+
 -- Absolute origin (scheme://host) for the request, honoring a reverse proxy's
 -- X-Forwarded-Proto/Host the same way app/routers/_shared.py's
 -- _api_cache_origin() does. Needed because the frontend is hosted on a
@@ -931,15 +955,16 @@ local function with_urls(req, row, adult_allowed)
     local media_id = row.id
     row.url = origin .. "/api/media/" .. media_id .. "/file"
     row.download_url = origin .. "/api/media/" .. media_id .. "/download"
-    if row.media_kind == "image" or row.media_kind == "video" then
-      row.thumb_url = append_query(origin .. "/api/media/" .. media_id .. "/thumb", "w", "640")
-    else
-      row.thumb_url = nil
-    end
+    row.thumb_url = M.thumb_url_for(origin, media_id, row.media_kind, row.updated_at)
+    if row.thumb_url then row.thumb_url = row.thumb_url:gsub("/thumb%?", "/thumb.webp?", 1) end
     if is_gif_media(row) then
       row.preview_url = row.url
     elseif row.media_kind == "image" then
-      row.preview_url = origin .. "/api/media/" .. media_id .. "/preview"
+      -- .webp path = edge-cacheable (see main.lua); v= busts it on edits.
+      row.preview_url = origin .. "/api/media/" .. media_id .. "/preview.webp"
+      if row.updated_at and row.updated_at ~= cjson.null then
+        row.preview_url = append_query(row.preview_url, "v", (tostring(row.updated_at):gsub("%D", "")))
+      end
     else
       row.preview_url = row.thumb_url
     end
@@ -1901,7 +1926,7 @@ local function creator_stats_for(user_id, origin)
 
   local top_posts, err1 = db.fetchall([[
     SELECT m.id, m.title, m.media_kind, m.mime_type, m.original_filename, m.storage_path,
-           m.views, m.downloads, m.created_at, m.visibility,
+           m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
            COUNT(DISTINCT l.user_id) AS like_count,
            COUNT(DISTINCT b.user_id) AS save_count,
            COUNT(DISTINCT cm.id) AS comment_count
@@ -1922,9 +1947,7 @@ local function creator_stats_for(user_id, origin)
     row.like_count = db.toint(row.like_count, 0)
     row.save_count = db.toint(row.save_count, 0)
     row.comment_count = db.toint(row.comment_count, 0)
-    if row.media_kind == "image" or row.media_kind == "video" then
-      row.thumb_url = append_query(origin .. "/api/media/" .. row.id .. "/thumb", "w", "640")
-    end
+    row.thumb_url = M.thumb_url_for(origin, row.id, row.media_kind, row.updated_at)
   end
 
   local daily_new_viewers, err2 = db.fetchall([[
@@ -2021,7 +2044,7 @@ function M.year_recap(req)
 
   local top_post = db.fetchone(
     [[
-      SELECT m.id, m.title, m.media_kind, m.views,
+      SELECT m.id, m.title, m.media_kind, m.views, m.updated_at,
              COUNT(DISTINCT l.user_id) AS like_count
       FROM media_items m
       LEFT JOIN media_likes l ON l.media_id = m.id
@@ -2073,9 +2096,7 @@ function M.year_recap(req)
       title = top_post.title,
       views = db.toint(top_post.views, 0),
       like_count = db.toint(top_post.like_count, 0),
-      thumb_url = (top_post.media_kind == "image" or top_post.media_kind == "video")
-        and append_query(origin .. "/api/media/" .. top_post_id .. "/thumb", "w", "640")
-        or nil,
+      thumb_url = M.thumb_url_for(origin, top_post_id, top_post.media_kind, top_post.updated_at),
     }
   end
 
@@ -5341,7 +5362,9 @@ function M.site_background(req)
   if is_gif_media(item) then
     url = origin .. "/api/media/" .. item.id .. "/file"
   else
-    url = append_query(origin .. "/api/media/" .. item.id .. "/thumb", "w", "1440")
+    -- .webp path so Cloudflare's edge caches it (see with_urls); every
+    -- visitor in a 5-minute rotation window then shares one render.
+    url = append_query(origin .. "/api/media/" .. item.id .. "/thumb.webp", "w", "1440")
   end
   return 200, {
     enabled = true,
@@ -7496,7 +7519,7 @@ function M.admin_flagged_media(req)
   local origin = request_origin(req)
   for _, row in ipairs(rows) do
     numify_media(row)
-    row.thumb_url = append_query(origin .. "/api/media/" .. row.id .. "/thumb", "w", "640")
+    row.thumb_url = M.thumb_url_for(origin, row.id, row.media_kind, row.updated_at)
   end
   return 200, { media = arr(rows) }
 end
@@ -8659,6 +8682,90 @@ end
 -- that then resize/re-encode it (render_webp_from_bytes for
 -- previews/thumbs) all inherit the watermark for free instead of each
 -- needing its own cache.
+-- ---------------------------------------------------------------------------
+-- Image renditions (2026-10-26): render from the file on disk, cache
+-- previews, pre-render the sizes the site actually asks for.
+-- (Hung off M -- this file is at LuaJIT's 200-local ceiling.)
+-- ---------------------------------------------------------------------------
+
+-- Standard sizes the frontend requests: grid cards (640), lightbox (1280),
+-- detail page preview (size=detail -> 1920 @ q92). Rendered together by the
+-- warmer so a post is fast everywhere before anyone opens it.
+M._GRID_THUMB_WIDTH = 640
+M._LIGHTBOX_THUMB_WIDTH = 1280
+M._PREVIEW_SIZES = { mini = { 360, 78 }, card = { 880, 86 }, detail = { 1920, 92 } }
+
+-- A path ffmpeg can read the original from without Lua loading the bytes:
+-- the original-bytes cache file if present, else the upload on disk.
+function M._image_source_path(item)
+  local cache_path = item.id and original_bytes_cache_path(item.id, item)
+  if cache_path then
+    local f = io.open(cache_path, "rb")
+    if f then
+      local size = f:seek("end")
+      f:close()
+      if size and size > 0 then return cache_path end
+    end
+  end
+  return media_files.legacy_upload_path(M.settings.uploads_dir, item.storage_path)
+end
+
+-- Slim row for the byte-serving image routes (thumb/preview). They only
+-- need access-control and file-location columns; fetch_media_by_id also
+-- computes like/comment/bookmark counts and subcategories (~7ms per call,
+-- i.e. ~0.4s of DB work per page of 48 thumbnails).
+function M._fetch_media_for_bytes(media_id)
+  return db.fetchone([[
+    SELECT m.id, m.user_id, m.media_kind, m.mime_type, m.original_filename, m.storage_path,
+           m.file_size, m.created_at, m.updated_at, m.visibility, m.is_adult,
+           m.youtube_video_id, m.deleted_at, m.expires_at, m.content_sha256
+    FROM media_items m
+    JOIN users u ON u.id = m.user_id
+    WHERE m.id = %s
+  ]], tostring(media_id))
+end
+
+function M._image_thumb_cache_path(media_id, width)
+  return M.settings.uploads_dir .. "/_thumb_cache/" .. media_id .. "_" .. width .. ".webp"
+end
+
+-- Versioned by updated_at (same idiom as original_bytes_cache_path), so an
+-- edited post gets a fresh preview instead of a stale cached one.
+function M._preview_cache_path(media_id, item, size)
+  local digest_seed = tostring(item.updated_at or item.created_at or media_id)
+  local key = sodium.sodium_bin2hex(sodium.crypto_hash_sha256(digest_seed)):sub(1, 12)
+  local shard = string.format("%02x", db.toint(media_id, 0) % 256)
+  return M.settings.uploads_dir .. "/_preview_cache/" .. shard .. "/" .. tostring(media_id) .. "_" .. size .. "_" .. key .. ".webp"
+end
+
+-- Shared cache headers for thumbs/previews. Public, non-adult, non-expiring
+-- posts may be cached by Cloudflare's edge (their URLs end in .webp, see
+-- with_urls); everything else is browser-only ("private").
+function M._image_cache_control(item, max_age)
+  local shareable = item.visibility == "public" and not item.is_adult and not nn(item.expires_at)
+  return (shareable and "public" or "private") .. ", max-age=" .. tostring(max_age or 604800) .. ", immutable"
+end
+
+function M._read_whole_file(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local bytes = M._read_file_chunked(f)
+  f:close()
+  if bytes == "" then return nil end
+  return bytes
+end
+
+function M._write_file_atomic(path, bytes)
+  local dir = path:match("^(.*)/[^/]+$")
+  if dir then os.execute("mkdir -p " .. shell_quote(dir)) end
+  local tmp = path .. ".part" .. tostring(math.random(100000, 999999))
+  local out = io.open(tmp, "wb")
+  if not out then return false end
+  out:write(bytes)
+  out:close()
+  return os.rename(tmp, path) and true or false
+end
+
 local function apply_image_watermark_if_configured(media_id, item, content, mime_type)
   if item.media_kind ~= "image" then return content end
   local watermark_text = nil -- WATERMARKS_ENABLED = false (get_user lookup for it removed too)
@@ -8731,6 +8838,33 @@ prewarm_video_thumb = function(media_id, item)
     if existing_marker then existing_marker:close() return end
     local cf = io.open(cache_path, "rb")
     if cf then cf:close() return end
+
+    -- A YouTube source link wins over the frame-grab -- same precedence
+    -- M.serve_media_thumb's lazy path already gives it. Without this check,
+    -- this prewarm would win the race against that lazy path every time
+    -- (it runs right at upload, long before any viewer's first GET), caching
+    -- the wrong (frame-grabbed) thumbnail permanently -- serve_media_thumb's
+    -- cache-hit check short-circuits before ever reaching its own YouTube
+    -- branch. Fetches the real YouTube thumbnail here instead of skipping
+    -- outright, so the uploader still sees it warm immediately like every
+    -- other video, rather than falling back to the lazy on-first-view path.
+    if item.youtube_video_id and item.youtube_video_id ~= cjson.null and nn(item.youtube_video_id) then
+      local slot_path = acquire_transcode_slot()
+      if not slot_path then return end
+      local marker = cache_path .. ".pending"
+      local out = io.open(marker, "wb")
+      if out then out:write(tostring(os.time())); out:close() end
+      local youtube_thumb = require("youtube_thumb")
+      local ok2, bytes = pcall(youtube_thumb.fetch_best_thumbnail_bytes, item.youtube_video_id)
+      local rendered = ok2 and bytes and media_files.render_webp_from_bytes(bytes, width, 84, nil)
+      if rendered then
+        local out2 = io.open(cache_path, "wb")
+        if out2 then out2:write(rendered); out2:close() end
+      end
+      os.remove(marker)
+      os.execute("rm -f " .. shell_quote(slot_path))
+      return
+    end
 
     local slot_path = acquire_transcode_slot()
     if not slot_path then return end -- box busy right now; the lazy path still covers this video
@@ -8859,7 +8993,7 @@ function M.serve_media_thumb(req)
   if not media_id then return 404, { detail = "Media not found." } end
   local auth = auth_optional(req)
   local viewer_id = auth and tostring(auth.id) or nil
-  local item = fetch_media_by_id(media_id, viewer_id or "0")
+  local item = M._fetch_media_for_bytes(media_id)
   if not item then return 404, { detail = "Media not found." } end
   item.is_adult = db.tobool(item.is_adult)
   local owner = viewer_id and tostring(item.user_id) == tostring(viewer_id)
@@ -8884,7 +9018,7 @@ function M.serve_media_thumb(req)
   if cf then
     local bytes = M._read_file_chunked(cf)
     cf:close()
-    return 200, bytes, { ["Content-Type"] = "image/webp", ["Cache-Control"] = "public, max-age=604800, immutable" }
+    return 200, bytes, { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
   end
 
   -- YouTube source-link override takes precedence over BOTH the video and
@@ -9018,16 +9152,21 @@ function M.serve_media_thumb(req)
 
   -- Images only below: a small-image webp encode is cheap (tens of ms), so
   -- this stays synchronous -- see media_files.lua's header comment.
-  local content = resolve_media_bytes(item)
-  if content then
-    content = apply_image_watermark_if_configured(media_id, item, content, item.mime_type)
-    local rendered = media_files.render_webp_from_bytes(content, width, 84, nil)
-    if rendered then
-      os.execute("mkdir -p " .. M.settings.uploads_dir .. "/_thumb_cache")
-      local out = io.open(cache_path, "wb")
-      if out then out:write(rendered); out:close() end
-      return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = "public, max-age=604800, immutable" }
+  -- Render straight from the original on disk when we can (2026-10-26):
+  -- skips loading a 4-15MB original into Lua and writing a temp copy of it.
+  -- (Watermarking is disabled, so the bytes path below adds nothing then.)
+  local src_path = M._image_source_path(item)
+  local rendered = src_path and media_files.render_webp_bytes_from_path(src_path, width, 84) or nil
+  if not rendered then
+    local content = resolve_media_bytes(item)
+    if content then
+      content = apply_image_watermark_if_configured(media_id, item, content, item.mime_type)
+      rendered = media_files.render_webp_from_bytes(content, width, 84, nil)
     end
+  end
+  if rendered then
+    M._write_file_atomic(cache_path, rendered)
+    return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
   end
   return 404, { detail = "File missing from database." }
 end
@@ -10568,6 +10707,128 @@ local function warm_one_pass(cursor_id)
   return "batch_done", last_id
 end
 
+-- Image rendition warmer (2026-10-26). Pre-renders, for every image post,
+-- the three sizes the site requests -- grid thumb (640), lightbox thumb
+-- (1280) and detail preview (1920) -- in ONE ffmpeg decode, so the first
+-- visitor never waits on a cold render. Recent uploads (last 15 minutes)
+-- are checked first on every round; the rest of the library is walked
+-- newest -> oldest, one image at a time, at the lowest CPU/IO priority, and
+-- the warmer backs off whenever the machine is busy (the music bots share
+-- this host). GALLERY_ENABLE_IMAGE_WARMER=false turns it off.
+function M._image_renditions_missing(item)
+  local wanted = {
+    { dst = M._image_thumb_cache_path(item.id, M._GRID_THUMB_WIDTH), max_edge = M._GRID_THUMB_WIDTH, quality = 84 },
+    { dst = M._image_thumb_cache_path(item.id, M._LIGHTBOX_THUMB_WIDTH), max_edge = M._LIGHTBOX_THUMB_WIDTH, quality = 84 },
+    { dst = M._preview_cache_path(item.id, item, "detail"), max_edge = M._PREVIEW_SIZES.detail[1], quality = M._PREVIEW_SIZES.detail[2] },
+  }
+  local missing = {}
+  for _, o in ipairs(wanted) do
+    local f = io.open(o.dst, "rb")
+    if f then f:close() else missing[#missing + 1] = o end
+  end
+  return missing
+end
+
+function M._system_busy()
+  local f = io.open("/proc/loadavg", "rb")
+  if not f then return false end
+  local load1 = tonumber((f:read("*l") or ""):match("^(%S+)"))
+  f:close()
+  if not M._ncpu then
+    local n = 0
+    local c = io.open("/proc/cpuinfo", "rb")
+    if c then
+      for line in c:lines() do if line:match("^processor") then n = n + 1 end end
+      c:close()
+    end
+    M._ncpu = math.max(1, n)
+  end
+  return load1 ~= nil and load1 > M._ncpu * 0.7
+end
+
+-- Renders whatever is missing for one image row. Returns number rendered.
+function M._warm_image_renditions(item)
+  if is_gif_media(item) then return 0 end
+  local missing = M._image_renditions_missing(item)
+  if #missing == 0 then return 0 end
+  local src = M._image_source_path(item)
+  if not src then return 0 end
+  for _, o in ipairs(missing) do
+    local dir = o.dst:match("^(.*)/[^/]+$")
+    if dir then os.execute("mkdir -p " .. shell_quote(dir)) end
+  end
+  local cmd, finish = media_files.render_webp_multi_cmd(src, missing, {
+    prefix = "nice -n 19 ionice -c3 " .. media_files.ffmpeg_bin() .. " -threads 2 -filter_complex_threads 1",
+  })
+  require("blockwatch").execute_yielding(cmd, { uncapped = true })
+  local rendered = 0
+  for _, ok in ipairs(finish()) do if ok then rendered = rendered + 1 end end
+  return rendered
+end
+
+function M.start_image_rendition_warmer()
+  local copas = require("copas")
+  local COLUMNS = "m.id, m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.created_at, m.updated_at"
+  local BASE_WHERE = "m.media_kind = 'image' AND m.deleted_at IS NULL"
+  copas.addthread(function()
+    copas.sleep(30) -- let a fresh restart settle first
+    local cursor = nil
+    local rendered_total, pass_started = 0, os.time()
+    local function warm_rows(rows)
+      for _, row in ipairs(rows) do
+        row.id = db.toint(row.id, row.id)
+        while M._system_busy() do copas.sleep(20) end
+        local ok, n = pcall(M._warm_image_renditions, row)
+        if not ok then
+          print("[nyxframe] image warmer: media " .. tostring(row.id) .. " failed: " .. tostring(n))
+        elseif n > 0 then
+          rendered_total = rendered_total + n
+          if rendered_total % 150 < n then
+            print(string.format("[nyxframe] image warmer: %d renditions so far this pass", rendered_total))
+          end
+          copas.sleep(0.25)
+        end
+      end
+    end
+    while true do
+      local t0 = M.telemetry.now()
+      local ok, err = pcall(function()
+        -- Fresh uploads first, every round.
+        local recent = db.fetchall("SELECT " .. COLUMNS .. " FROM media_items m WHERE " .. BASE_WHERE
+          .. " AND m.created_at > now() - interval '15 minutes' ORDER BY m.id DESC LIMIT 50")
+        warm_rows(recent or {})
+        local rows
+        if cursor then
+          rows = db.fetchall("SELECT " .. COLUMNS .. " FROM media_items m WHERE " .. BASE_WHERE
+            .. " AND m.id < %s ORDER BY m.id DESC LIMIT 25", tostring(cursor))
+        else
+          rows = db.fetchall("SELECT " .. COLUMNS .. " FROM media_items m WHERE " .. BASE_WHERE
+            .. " ORDER BY m.id DESC LIMIT 25")
+        end
+        rows = rows or {}
+        if #rows == 0 then
+          if rendered_total > 0 then
+            print(string.format("[nyxframe] image warmer: pass done, %d renditions in %ds", rendered_total, os.time() - pass_started))
+          end
+          M.telemetry.job_result("image_warmer", true, M.telemetry.ms_since(t0), { event = "pass_done", rendered = rendered_total })
+          cursor, rendered_total, pass_started = nil, 0, os.time()
+          copas.sleep(60)
+          return
+        end
+        warm_rows(rows)
+        cursor = db.toint(rows[#rows].id, rows[#rows].id)
+      end)
+      if not ok then
+        print("[nyxframe] image warmer error: " .. tostring(err))
+        M.telemetry.job_result("image_warmer", false, M.telemetry.ms_since(t0), { error = tostring(err):sub(1, 300) })
+        copas.sleep(30)
+      else
+        copas.sleep(0.5)
+      end
+    end
+  end)
+end
+
 -- Starts the transcode.warmer. Call once from main.lua, already gated to the primary
 -- worker there. A pcall around each pass means one bad row or a transient
 -- filesystem error logs and backs off instead of ever killing the
@@ -11619,7 +11880,7 @@ function M.serve_media_preview(req)
   if not media_id then return 404, { detail = "Media not found." } end
   local auth = auth_optional(req)
   local viewer_id = auth and tostring(auth.id) or nil
-  local item = fetch_media_by_id(media_id, viewer_id or "0")
+  local item = M._fetch_media_for_bytes(media_id)
   if not item or nn(item.deleted_at) ~= nil then return 404, { detail = "Media not found." } end
   item.is_adult = db.tobool(item.is_adult)
   local owner = viewer_id and tostring(item.user_id) == tostring(viewer_id)
@@ -11632,24 +11893,67 @@ function M.serve_media_preview(req)
   if tostring(item.media_kind or "") ~= "image" then
     return serve_media_bytes_response(req, media_id, false)
   end
-  local content = resolve_media_bytes(item)
-  if not content then
-    return 404, { detail = "Preview is missing. Re-upload this post once so it can be saved into the new DB-backed file store." }
-  end
-  content = apply_image_watermark_if_configured(media_id, item, content, item.mime_type)
   local size = tostring(req.query.size or "card")
-  local max_edge = ({ mini = 360, detail = 1920 })[size] or 880
-  local quality = ({ mini = 78, detail = 92 })[size] or 86
-  local rendered = media_files.render_webp_from_bytes(content, max_edge, quality)
-  if rendered then
-    return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = "public, max-age=86400" }
+  if not M._PREVIEW_SIZES[size] then size = "card" end
+  local max_edge, quality = M._PREVIEW_SIZES[size][1], M._PREVIEW_SIZES[size][2]
+  local headers = { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
+
+  -- Disk cache (2026-10-26): previews used to be re-rendered by ffmpeg on
+  -- EVERY view (1-2s for a detail page). Now rendered once (or ahead of
+  -- time by the rendition warmer) and served from _preview_cache.
+  local cache_path = M._preview_cache_path(media_id, item, size)
+  local cached = M._read_whole_file(cache_path)
+  if cached then return 200, cached, headers end
+
+  local src_path = M._image_source_path(item)
+  local rendered = src_path and media_files.render_webp_bytes_from_path(src_path, max_edge, quality) or nil
+  local content
+  if not rendered then
+    content = resolve_media_bytes(item)
+    if not content then
+      return 404, { detail = "Preview is missing. Re-upload this post once so it can be saved into the new DB-backed file store." }
+    end
+    content = apply_image_watermark_if_configured(media_id, item, content, item.mime_type)
+    rendered = media_files.render_webp_from_bytes(content, max_edge, quality)
   end
-  return 200, content, { ["Content-Type"] = item.mime_type or "application/octet-stream", ["Cache-Control"] = "public, max-age=86400" }
+  if rendered then
+    M._write_file_atomic(cache_path, rendered)
+    return 200, rendered, headers
+  end
+  return 200, content, { ["Content-Type"] = item.mime_type or "application/octet-stream", ["Cache-Control"] = "private, max-age=86400" }
+end
+
+-- Avatars are shown at most ~128px but were served at upload size (100KB+)
+-- straight out of a bytea column on every page. Now a 256px WEBP is
+-- rendered once per avatar file and kept in _preview_cache/avatars; only
+-- the tiny id/sha row is read from the DB. GIFs stay as uploaded (animated).
+function M._avatar_rendition(user_id)
+  local meta = db.fetchone([[
+    SELECT f.id, f.sha256, f.mime_type FROM user_avatar_files f
+    JOIN users u ON u.avatar_file_id = f.id WHERE u.id = %s
+  ]], user_id)
+  if not meta or nn(meta.mime_type) == "image/gif" then return nil end
+  local path = M.settings.uploads_dir .. "/_preview_cache/avatars/" .. tostring(user_id) .. "_"
+    .. tostring(meta.id) .. "_" .. tostring(nn(meta.sha256) or ""):sub(1, 12) .. ".webp"
+  local cached = M._read_whole_file(path)
+  if cached then return cached end
+  local file_row = media_files.get_avatar_file(user_id)
+  if not (file_row and file_row.content and #file_row.content > 0) then return nil end
+  local rendered = media_files.render_webp_from_bytes(file_row.content, 256, 86)
+  if rendered and #rendered > 0 and #rendered < #file_row.content then
+    M._write_file_atomic(path, rendered)
+    return rendered
+  end
+  return nil
 end
 
 function M.serve_user_avatar(req)
   local user_id = tonumber(req.params.user_id)
   if not user_id then return 404, { detail = "User not found." } end
+  local ok_small, small = pcall(M._avatar_rendition, user_id)
+  if ok_small and small then
+    return 200, small, { ["Content-Type"] = "image/webp", ["Cache-Control"] = "public, max-age=86400" }
+  end
   local file_row = media_files.get_avatar_file(user_id)
   if file_row and file_row.content and #file_row.content > 0 then
     return 200, file_row.content, { ["Content-Type"] = file_row.mime_type or "image/jpeg", ["Cache-Control"] = "public, max-age=86400" }

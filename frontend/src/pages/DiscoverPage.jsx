@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Bell, Columns2, Grid2X2, RefreshCw, Save, Search, SlidersHorizontal, Sparkles, X as XIcon } from "lucide-react";
-import { apiFetch, cachedApiFetch, clearApiCache, toQuery } from "../api.js";
+import { apiFetch, cachedApiFetch, clearApiCache, prefetchApi, toQuery } from "../api.js";
 import { PAGE_SIZE } from "../config.js";
 import { CategoryPills, DiscoverContinueWatching, DiscoverMemories, DiscoverTrending } from "../components/discover.jsx";
 import { MediaGrid } from "../components/media.jsx";
@@ -191,8 +191,10 @@ export function DiscoverPage({ ctx }) {
     const generation = append ? generationRef.current : ++generationRef.current;
     const isCurrent = () => generation === generationRef.current;
     try {
+      // Appends read the cache too (no stale fallback), so the page that was
+      // prefetched in the background shows instantly when the viewer scrolls.
       const data = append
-        ? await apiFetch(path)
+        ? await cachedApiFetch(path, { ttl: 60_000, staleTtl: 0, allowStale: false, storage: "session" })
         : await cachedApiFetch(path, { ttl: 20_000, staleTtl: 5 * 60_000, storage: "session" });
       if (!isCurrent()) return;
       const rows = data.media || [];
@@ -206,6 +208,11 @@ export function DiscoverPage({ ctx }) {
       }
       setHasNext(rows.length > pageSize);
       preloadMediaAssets(rows, { limit: 6 });
+      if (rows.length > pageSize) {
+        const nextPath = `/api/media${toQuery({ ...queryParams, offset: page * pageSize })}`;
+        const idle = window.requestIdleCallback || ((fn) => window.setTimeout(fn, 800));
+        idle(() => prefetchApi(nextPath, { ttl: 60_000, staleTtl: 0, storage: "session" }));
+      }
     } catch (err) {
       if (!isCurrent()) return;
       if (!append) { setError(err.message); setItems([]); setHasNext(false); }
@@ -223,8 +230,15 @@ export function DiscoverPage({ ctx }) {
 
   // Filter change → reset and reload. Debounced so typing in the search box
   // or the uploader/size/date text fields doesn't fire an API call per keystroke.
+  // The first load and dropdown/chip changes (sort, kind, category, 18+)
+  // run immediately -- the 300ms wait used to delay every home page load.
+  const prevFiltersRef = useRef(null);
   useEffect(() => {
     setLoading(true);
+    const prev = prevFiltersRef.current;
+    prevFiltersRef.current = filters;
+    const typed = ["q", "uploader", "min_size", "max_size", "date_from", "date_to"];
+    const delay = prev && typed.some((key) => prev[key] !== filters[key]) ? 300 : 0;
     const timer = window.setTimeout(() => {
       pageRef.current = 1;
       setHasNext(false);
@@ -251,7 +265,7 @@ export function DiscoverPage({ ctx }) {
         // Private-browsing/storage-disabled -- filters just won't survive a
         // tab switch in that case, same as before this fix.
       }
-    }, 300);
+    }, delay);
     return () => window.clearTimeout(timer);
   }, [filters]); // intentionally omit loadMedia/setSearchParams — stable refs
 

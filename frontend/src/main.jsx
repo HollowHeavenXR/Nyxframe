@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
-import App from "./App.jsx";
+import App, { preloadRouteFor } from "./App.jsx";
 import "./styles.css";
 import { startRemoteOriginPolling } from "./api.js";
 
@@ -63,10 +63,17 @@ document.addEventListener("contextmenu", (event) => {
   event.preventDefault();
 }, { capture: true });
 
-createRoot(document.getElementById("root")).render(
+const basename = runtimeBasename();
+const routePath = window.location.pathname.slice(basename.length) || "/";
+const renderApp = () => createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <BrowserRouter basename={runtimeBasename()}>
+    <BrowserRouter basename={basename}>
       <App />
     </BrowserRouter>
   </React.StrictMode>,
 );
+// Wait (briefly) for the current route's chunk; see preloadRouteFor.
+Promise.race([
+  preloadRouteFor(routePath),
+  new Promise((resolve) => window.setTimeout(resolve, 2500)),
+]).then(renderApp, renderApp);

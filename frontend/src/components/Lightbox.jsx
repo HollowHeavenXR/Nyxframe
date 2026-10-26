@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { Bookmark, ChevronLeft, ChevronRight, Copy, Download, ExternalLink, Heart, Pause, Play, X } from "lucide-react";
 import { apiFetch } from "../api.js";
 import { useMediaActions } from "../hooks/useMediaActions.js";
-import { Avatar, ChipRow, glassPointerMove, ResilientImage, StatsRow } from "./ui.jsx";
+import { Avatar, ChipRow, glassPointerMove, ProgressiveImage, ResilientImage, StatsRow } from "./ui.jsx";
 import { VideoPlayer } from "./VideoPlayer.jsx";
 import { isGifMedia, mediaImageSources, thumbUrl, videoQualityUrl } from "../utils/media.js";
 
@@ -71,6 +71,20 @@ export function Lightbox({ ctx, lightbox: lightboxProp }) {
       }
     });
     return () => { cancelled = true; };
+  }, [currentIndex, items]);
+
+  // Warm the next/previous image so arrow-key/swipe navigation is instant.
+  useEffect(() => {
+    if (typeof Image === "undefined") return;
+    [currentIndex + 1, currentIndex - 1].forEach((i) => {
+      const neighbour = items[i];
+      if (!neighbour || neighbour.locked || neighbour.media_kind !== "image" || isGifMedia(neighbour)) return;
+      const src = thumbUrl(neighbour, 1280);
+      if (!src) return;
+      const img = new Image();
+      img.decoding = "async";
+      img.src = src;
+    });
   }, [currentIndex, items]);
 
   const goTo = useCallback((idx) => {
@@ -165,11 +179,17 @@ export function Lightbox({ ctx, lightbox: lightboxProp }) {
               mediaId={item.id}
             />
           ) : (
-            <ResilientImage
-              className={gif ? "gif-full" : "lb-img"}
-              sources={imageSources}
-              alt={item.title || ""}
-            />
+            gif ? (
+              <ResilientImage className="gif-full" sources={imageSources} alt={item.title || ""} />
+            ) : (
+              <ProgressiveImage
+                className="lb-img"
+                placeholder={thumbUrl(item, 640)}
+                sources={imageSources}
+                alt={item.title || ""}
+                decoding="async"
+              />
+            )
           )}
         </div>
 

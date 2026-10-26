@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { apiFetch, cachedApiFetch, clearApiCache, forceRefreshRemoteOrigin, prefetchApi, readStoredUser, readToken, resolveApiUrl, toQuery, writeStoredUser, writeToken } from "./api.js";
 import { Shell } from "./components/Shell.jsx";
@@ -20,8 +20,18 @@ import { DiscoverPage } from "./pages/DiscoverPage.jsx";
 // Named exports -> default-export shape React.lazy expects. A failed chunk
 // load (a deploy replaced the hashed files under an open tab) reloads the
 // page once to pick up the new build instead of leaving a dead route.
+//
+// Once a chunk has loaded (prefetched at idle, or opened before) the page
+// renders directly instead of through React.lazy: lazy always suspends on
+// first render, and React holds a suspended reveal for ~300ms, which was
+// most of the delay opening the first post in the lightbox.
 function lazyPage(loader, name) {
-  return lazy(() => loader().then(
+  let Loaded = null;
+  const load = () => loader().then((module) => {
+    Loaded = module[name];
+    return module;
+  });
+  const Lazy = lazy(() => load().then(
     (module) => ({ default: module[name] }),
     (error) => {
       const flag = "nyxframe_chunk_reload";
@@ -38,6 +48,14 @@ function lazyPage(loader, name) {
       throw error;
     },
   ));
+  function Page(props) {
+    // Fixed per mount, so a chunk finishing mid-render never swaps the
+    // element type (which would remount the page and drop its state).
+    const [Direct] = useState(() => Loaded);
+    return Direct ? <Direct {...props} /> : <Lazy {...props} />;
+  }
+  Page.preload = () => load().catch(() => {});
+  return Page;
 }
 
 const AdminPage = lazyPage(() => import("./pages/AdminPage.jsx"), "AdminPage");
@@ -63,14 +81,45 @@ const ApiDocsPage = lazyPage(() => import("./pages/ApiDocsPage.jsx"), "ApiDocsPa
 const YearRecapPage = lazyPage(() => import("./pages/YearRecapPage.jsx"), "YearRecapPage");
 const Lightbox = lazyPage(() => import("./components/Lightbox.jsx"), "Lightbox");
 
+// Cold load straight onto a lazy route (a shared /media/123 link, a search
+// URL): main.jsx waits for that page's chunk before the first render, so it
+// mounts directly instead of suspending (React holds a suspended reveal for
+// ~300ms even after the chunk arrives). The chunk download is the same
+// either way; only the forced wait goes away.
+const ROUTE_CHUNKS = [
+  [/^\/media\/[^/]+\/similar/, () => SimilarMediaPage],
+  [/^\/media\//, () => MediaDetailPage],
+  [/^\/category\//, () => CategoryPage],
+  [/^\/(following|liked|for-you)\b/, () => FeedPage],
+  [/^\/trending\b/, () => TrendingPage],
+  [/^\/search\b/, () => SearchPage],
+  [/^\/users\/[^/]+/, () => ProfilePage],
+  [/^\/users\b/, () => UsersPage],
+  [/^\/collections\b/, () => CollectionsPage],
+  [/^\/visual-search\b/, () => VisualSearchPage],
+  [/^\/friends\b/, () => FriendsPage],
+  [/^\/messages\b/, () => MessagesPage],
+  [/^\/studio\b/, () => StudioPage],
+  [/^\/upload\b/, () => UploadPage],
+  [/^\/settings\b/, () => SettingsPage],
+  [/^\/admin\b/, () => AdminPage],
+  [/^\/other-projects\b/, () => OtherProjectsPage],
+  [/^\/status\b/, () => StatusPage],
+  [/^\/api-docs\b/, () => ApiDocsPage],
+  [/^\/year-recap\b/, () => YearRecapPage],
+  [/^\/login\b/, () => AuthPage],
+];
+
+export function preloadRouteFor(pathname) {
+  const match = ROUTE_CHUNKS.find(([pattern]) => pattern.test(pathname || "/"));
+  return match ? match[1]().preload() : Promise.resolve();
+}
+
 // Warm the chunks people are most likely to open next once the app is idle,
 // so the first click into a post or a feed doesn't wait on a download.
 function prefetchLikelyRoutes() {
   const run = () => {
-    import("./pages/MediaDetailPage.jsx").catch(() => {});
-    import("./components/Lightbox.jsx").catch(() => {});
-    import("./pages/TrendingPage.jsx").catch(() => {});
-    import("./pages/ProfilePage.jsx").catch(() => {});
+    [Lightbox, MediaDetailPage, TrendingPage, ProfilePage, CategoryPage, SearchPage].forEach((page) => page.preload());
   };
   if (typeof window === "undefined") return;
   if (navigator.connection?.saveData) return;
@@ -143,6 +192,8 @@ function App() {
   const [bootLeaving, setBootLeaving] = useState(false);
   const [sessionReady, setSessionReady] = useState(() => !readStoredUser());
   const [lookupsReady, setLookupsReady] = useState(false);
+  const bootMountedAt = useRef(performance.now());
+  const [deckPrimed, setDeckPrimed] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [quickTheme, setQuickTheme] = useState(() => localStorage.getItem(QUICK_THEME_KEY) || "");
 
@@ -241,6 +292,8 @@ function App() {
     setUserState(payload.user);
     setSessionReady(true);
     setLookupsReady(false);
+    setDeckPrimed(false);
+    bootMountedAt.current = performance.now();
     setBootDismissed(false);
     setBootLeaving(false);
     setBootPhase("Curating your live feed");
@@ -389,32 +442,32 @@ function App() {
     }
   }, [bootDismissed, lookupsReady, sessionReady]);
 
+  // Priming the first gallery page used to wait for /api/categories (the
+  // biggest lookup) before even starting, then held the overlay for a fixed
+  // 600ms floor. Now the deck fetch starts as soon as the session is known,
+  // in parallel with the lookups, and the overlay only stays up as long as
+  // the data actually takes. The overlay itself fades in after ~300ms (CSS),
+  // so a warm load never shows it at all.
   useEffect(() => {
-    if (bootDismissed || !lookupsReady || !sessionReady) return undefined;
+    if (bootDismissed || !sessionReady) return undefined;
     let cancelled = false;
-    const startedAt = Date.now();
     const settings = { ...DEFAULT_SETTINGS, ...(user?.user_settings || {}) };
     const pageSize = galleryPageSize(settings);
     const sort = settings.default_sort || DEFAULT_SETTINGS.default_sort || "new";
     const discoverQuery = toQuery({ limit: pageSize + 1, offset: 0, adult: "show", sort });
 
-    const finishBoot = async () => {
-      // A short floor keeps the overlay from flashing on a warm cache; it
-      // used to be 1.5s, which was pure added wait on every cold start.
-      const remaining = Math.max(0, 600 - (Date.now() - startedAt));
-      if (remaining) {
-        await new Promise((resolve) => window.setTimeout(resolve, remaining));
-      }
-      if (cancelled) return;
-      setBootLeaving(true);
-      window.setTimeout(() => {
-        if (cancelled) return;
-        setBootDismissed(true);
-        setBootLeaving(false);
-      }, 420);
-    };
+    // Only the home page shows the deck; any other route (a shared link,
+    // search, a profile) lifts the overlay without waiting for it and
+    // primes the deck in the background instead.
+    const onHome = (window.location.pathname.replace(/\/+$/, "") || "/") === "/"
+      || window.location.pathname.replace(/\/+$/, "") === "/static/react";
+    if (!onHome) setDeckPrimed(true);
 
     const primeDeck = async () => {
+      if (!onHome) {
+        await new Promise((resolve) => (window.requestIdleCallback || ((fn) => window.setTimeout(fn, 1500)))(resolve));
+        if (cancelled) return;
+      }
       setBootPhase(user ? "Curating your live feed" : "Developing preview wall");
       await Promise.allSettled([
         cachedApiFetch(`/api/media${discoverQuery}`, { ttl: 20_000, staleTtl: 5 * 60_000, storage: "session" }),
@@ -423,19 +476,49 @@ function App() {
         user ? cachedApiFetch(`/api/feed/following${toQuery({ limit: pageSize + 1, offset: 0 })}`, { ttl: 20_000, staleTtl: 3 * 60_000, storage: "session" }) : Promise.resolve(null),
       ]);
       if (cancelled) return;
-      prefetchApi(`/api/media${toQuery({ limit: pageSize + 1, offset: pageSize, adult: "show", sort })}`, { ttl: 20_000, staleTtl: 5 * 60_000, storage: "session" });
-      if (user) {
-        prefetchApi(`/api/feed/following${toQuery({ limit: pageSize + 1, offset: pageSize })}`, { ttl: 20_000, staleTtl: 3 * 60_000, storage: "session" });
-      }
-      setBootPhase("Developing preview wall");
-      await finishBoot();
+      setDeckPrimed(true);
+      // The next page is only needed once the viewer scrolls; fetch it when
+      // the browser is idle so it doesn't compete with first-screen thumbs.
+      const idle = window.requestIdleCallback || ((fn) => window.setTimeout(fn, 1200));
+      idle(() => {
+        prefetchApi(`/api/media${toQuery({ limit: pageSize + 1, offset: pageSize, adult: "show", sort })}`, { ttl: 60_000, staleTtl: 0, storage: "session" });
+        if (user) {
+          prefetchApi(`/api/feed/following${toQuery({ limit: pageSize + 1, offset: pageSize })}`, { ttl: 20_000, staleTtl: 3 * 60_000, storage: "session" });
+        }
+      });
     };
 
     primeDeck();
     return () => {
       cancelled = true;
     };
-  }, [bootDismissed, lookupsReady, sessionReady, user]);
+  }, [bootDismissed, sessionReady, user]);
+
+  useEffect(() => {
+    if (bootDismissed || !deckPrimed || !lookupsReady || !sessionReady) return undefined;
+    let cancelled = false;
+    setBootPhase("Developing preview wall");
+    // Overlay not visible yet (CSS delays it ~300ms): drop it immediately.
+    // Once visible, keep it up briefly so it doesn't flash, then fade.
+    const shownFor = performance.now() - bootMountedAt.current - 300;
+    const hold = shownFor <= 0 ? 0 : Math.max(0, 250 - shownFor);
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      if (shownFor <= 0) {
+        setBootDismissed(true);
+        return;
+      }
+      setBootLeaving(true);
+      window.setTimeout(() => {
+        setBootDismissed(true);
+        setBootLeaving(false);
+      }, 300);
+    }, hold);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [bootDismissed, deckPrimed, lookupsReady, sessionReady]);
 
   const baseSettings = useMemo(
     () => ({ ...DEFAULT_SETTINGS, ...(user?.user_settings || {}) }),

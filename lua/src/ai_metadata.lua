@@ -70,6 +70,7 @@ local CHARACTER_RECOGNITION_GUIDE = {
   { "Xenoblade", { "Pyra", "Mythra", "Nia", "Mio", "Eunie", "Noah" } },
   { "Hyperdimension Neptunia", { "Neptune", "Nepgear", "Noire", "Blanc", "Vert", "Uzume", "Plutia" } },
   { "KPOP Demon Hunters", { "Huntrix", "Mira", "Zoey", "Rumi" } },
+  { "Date A Live", { "Kurumi Tokisaki", "Tohka Yatogami", "Kotori Itsuka", "Origami Tobiichi", "Yoshino", "Miku Izayoi", "Natsumi", "Mukuro Hoshimiya", "Kaguya Yamai", "Shido Itsuka" } },
 }
 
 -- alias -> { display_name, category_name, subcategory_name, {tags} }
@@ -94,6 +95,24 @@ local DOMAIN_CHARACTER_ALIASES = {
   ["mira"] = { "Mira", "KPOP Demon Hunters", "Huntrix", { "mira", "huntrix", "kpop demon hunters" } },
   ["zoey"] = { "Zoey", "KPOP Demon Hunters", "Huntrix", { "zoey", "huntrix", "kpop demon hunters" } },
   ["saja boys"] = { "Saja Boys", "KPOP Demon Hunters", "Saja Boys", { "saja boys", "kpop demon hunters" } },
+  -- Date A Live (2026-10-26): both name orders -- booru/Japanese sources
+  -- write the family name first ("tokisaki kurumi").
+  ["kurumi tokisaki"] = { "Kurumi Tokisaki", "Date A Live", "Kurumi Tokisaki", { "kurumi tokisaki", "date a live" } },
+  ["tokisaki kurumi"] = { "Kurumi Tokisaki", "Date A Live", "Kurumi Tokisaki", { "kurumi tokisaki", "date a live" } },
+  ["tohka yatogami"] = { "Tohka Yatogami", "Date A Live", "Tohka Yatogami", { "tohka yatogami", "date a live" } },
+  ["yatogami tohka"] = { "Tohka Yatogami", "Date A Live", "Tohka Yatogami", { "tohka yatogami", "date a live" } },
+  ["kotori itsuka"] = { "Kotori Itsuka", "Date A Live", "Kotori Itsuka", { "kotori itsuka", "date a live" } },
+  ["itsuka kotori"] = { "Kotori Itsuka", "Date A Live", "Kotori Itsuka", { "kotori itsuka", "date a live" } },
+  ["origami tobiichi"] = { "Origami Tobiichi", "Date A Live", "Origami Tobiichi", { "origami tobiichi", "date a live" } },
+  ["tobiichi origami"] = { "Origami Tobiichi", "Date A Live", "Origami Tobiichi", { "origami tobiichi", "date a live" } },
+  ["miku izayoi"] = { "Miku Izayoi", "Date A Live", "Miku Izayoi", { "miku izayoi", "date a live" } },
+  ["izayoi miku"] = { "Miku Izayoi", "Date A Live", "Miku Izayoi", { "miku izayoi", "date a live" } },
+  ["mukuro hoshimiya"] = { "Mukuro Hoshimiya", "Date A Live", "Mukuro Hoshimiya", { "mukuro hoshimiya", "date a live" } },
+  ["hoshimiya mukuro"] = { "Mukuro Hoshimiya", "Date A Live", "Mukuro Hoshimiya", { "mukuro hoshimiya", "date a live" } },
+  ["kaguya yamai"] = { "Kaguya Yamai", "Date A Live", "Kaguya Yamai", { "kaguya yamai", "date a live" } },
+  ["yamai kaguya"] = { "Kaguya Yamai", "Date A Live", "Kaguya Yamai", { "kaguya yamai", "date a live" } },
+  ["shido itsuka"] = { "Shido Itsuka", "Date A Live", "Shido Itsuka", { "shido itsuka", "date a live" } },
+  ["itsuka shido"] = { "Shido Itsuka", "Date A Live", "Shido Itsuka", { "shido itsuka", "date a live" } },
 }
 -- Preserve insertion order for domain-hint matching (Lua tables have no
 -- guaranteed iteration order; Python's dict does).
@@ -102,6 +121,7 @@ local DOMAIN_CHARACTER_ALIAS_ORDER = {
   "twilight sparkle", "rainbow dash", "pinkie pie", "fluttershy", "applejack",
   "rarity", "spike", "starlight glimmer", "trixie", "derpy",
   "huntrix", "rumi", "mira", "zoey", "saja boys",
+  "kurumi tokisaki", "tokisaki kurumi", "tohka yatogami", "yatogami tohka", "kotori itsuka", "itsuka kotori", "origami tobiichi", "tobiichi origami", "miku izayoi", "izayoi miku", "mukuro hoshimiya", "hoshimiya mukuro", "kaguya yamai", "yamai kaguya", "shido itsuka", "itsuka shido",
 }
 
 local MAX_ANALYSIS_SUBCATEGORIES = 3
@@ -385,6 +405,8 @@ local function pretty_tag(tag)
   return table.concat(out, " ")
 end
 
+local filename_subject_text -- defined below; used by compose_specific_title
+
 local function compose_specific_title(title, filename, category_name, subcategory_name, tags, media_kind)
   local ct = clean_title(title)
   if ct ~= "" and not is_bad_subject_title(ct, category_name, subcategory_name) then return ct:sub(1, 160) end
@@ -419,6 +441,13 @@ local function compose_specific_title(title, filename, category_name, subcategor
 
   if #preferred_tags > 0 then
     if #preferred_tags >= 2 then
+      -- Two words that sit next to each other in the filename are almost
+      -- always one name ("tokisaki_kurumi"), not two subjects -- real pairs
+      -- are written "a_and_b". Keep them together.
+      local subject = " " .. filename_subject_text(filename):lower():gsub("[^a-z0-9]+", " ") .. " "
+      if subject:find(" " .. preferred_tags[1]:lower() .. " " .. preferred_tags[2]:lower() .. " ", 1, true) then
+        return (preferred_tags[1] .. " " .. preferred_tags[2] .. " " .. category_suffix(category_name, media_kind)):sub(1, 160)
+      end
       return (preferred_tags[1] .. " and " .. preferred_tags[2] .. " " .. category_suffix(category_name, media_kind)):sub(1, 160)
     end
     return (preferred_tags[1] .. " " .. category_suffix(category_name, media_kind)):sub(1, 160)
@@ -484,7 +513,7 @@ end
 -- Mirrors _filename_subject_text(): a cleaned, credit-tail-stripped subject
 -- string derived from the filename stem, or "" if the stem carries no real
 -- signal (camera-generated names, hex hashes, etc).
-local function filename_subject_text(filename)
+function filename_subject_text(filename)
   local stem = tostring(filename or ""):match("([^/\\]+)$") or ""
   stem = stem:match("^(.*)%.[^.]+$") or stem
   if stem == "" then return "" end
@@ -516,6 +545,183 @@ local function filename_subject_text(filename)
     return ""
   end
   return cleaned
+end
+
+-- ---------------------------------------------------------------------------
+-- Booru-style filenames (2026-10-26)
+-- ---------------------------------------------------------------------------
+-- Danbooru saves files as
+--   __<characters>_<copyrights>_drawn_by_<artist>__<md5>.jpg
+-- e.g. __tokisaki_kurumi_date_a_live_drawn_by_hci__sample-887b....jpg.
+-- Characters are family-name-first and multi-word, so the generic
+-- word-per-tag fallback split "tokisaki_kurumi" into two "subjects" and
+-- titled the post "Tokisaki and Kurumi Phone Background". This parser keeps
+-- names whole: known characters are resolved to their gallery display name
+-- (Western order, matching the existing subcategories), known series are
+-- peeled off the end, and anything left over is kept as one name.
+
+-- booru name (underscored) -> { display name, series display name }
+local BOORU_CHARACTERS = {
+  tokisaki_kurumi = { "Kurumi Tokisaki", "Date A Live" },
+  yatogami_tohka = { "Tohka Yatogami", "Date A Live" },
+  itsuka_kotori = { "Kotori Itsuka", "Date A Live" },
+  itsuka_shidou = { "Shido Itsuka", "Date A Live" },
+  tobiichi_origami = { "Origami Tobiichi", "Date A Live" },
+  himekawa_yoshino = { "Yoshino", "Date A Live" },
+  yoshino_date_a_live = { "Yoshino", "Date A Live" },
+  izayoi_miku = { "Miku Izayoi", "Date A Live" },
+  natsumi_date_a_live = { "Natsumi", "Date A Live" },
+  hoshimiya_mukuro = { "Mukuro Hoshimiya", "Date A Live" },
+  yamai_kaguya = { "Kaguya Yamai", "Date A Live" },
+  yamai_yuzuru = { "Yuzuru Yamai", "Date A Live" },
+  takamiya_mana = { "Mana Takamiya", "Date A Live" },
+  takamiya_mio = { "Mio Takamiya", "Date A Live" },
+  murasame_reine = { "Reine Murasame", "Date A Live" },
+  honjou_nia = { "Nia Honjou", "Date A Live" },
+  hornet_hollow_knight = { "Hornet", "Hollow Knight" },
+  hornet = { "Hornet", nil },
+}
+-- Longest first, so "yamai_kaguya" wins over a shorter prefix.
+local BOORU_CHARACTER_KEYS = {}
+for k in pairs(BOORU_CHARACTERS) do BOORU_CHARACTER_KEYS[#BOORU_CHARACTER_KEYS + 1] = k end
+table.sort(BOORU_CHARACTER_KEYS, function(a, b) return #a > #b end)
+
+-- booru copyright tag -> display name
+local BOORU_COPYRIGHTS = {
+  date_a_live = "Date A Live", azur_lane = "Azur Lane", punishing_gray_raven = "Punishing: Gray Raven",
+  hollow_knight = "Hollow Knight", zenless_zone_zero = "Zenless Zone Zero", genshin_impact = "Genshin Impact",
+  honkai_star_rail = "Honkai: Star Rail", honkai_impact_3rd = "Honkai Impact 3rd", blue_archive = "Blue Archive",
+  goddess_of_victory_nikke = "Nikke", arknights = "Arknights", wuthering_waves = "Wuthering Waves",
+  xenoblade_chronicles_2 = "Xenoblade Chronicles 2", xenoblade_chronicles_3 = "Xenoblade Chronicles 3",
+  xenoblade_chronicles = "Xenoblade", kpop_demon_hunters = "KPOP Demon Hunters",
+  my_little_pony = "My Little Pony", my_little_pony_equestria_girls = "My Little Pony",
+  my_little_pony_friendship_is_magic = "My Little Pony", resident_evil = "Resident Evil",
+  final_fantasy_vii = "Final Fantasy", final_fantasy_vii_remake = "Final Fantasy", final_fantasy = "Final Fantasy",
+  sonic_the_hedgehog = "Sonic", sonic_series = "Sonic", overwatch = "Overwatch", overwatch_2 = "Overwatch",
+  fate_grand_order = "Fate/Grand Order", fate_series = "Fate", hololive = "Hololive", pokemon = "Pokemon",
+  street_fighter = "Street Fighter", street_fighter_6 = "Street Fighter", monster_hunter = "Monster Hunter",
+  doki_doki_literature_club = "Doki Doki Literature Club", bayonetta = "Bayonetta", bayonetta_series = "Bayonetta",
+  kingdom_hearts = "Kingdom Hearts", dragon_ball = "Dragon Ball", dragon_ball_z = "Dragon Ball",
+  super_smash_bros = "Super Smash Bros.", mario_series = "Mario", super_mario_bros = "Mario",
+  neptune_series = "Hyperdimension Neptunia", re_zero_kara_hajimeru_isekai_seikatsu = "Re:Zero",
+  sword_art_online = "Sword Art Online", darling_in_the_franxx = "Darling in the Franxx",
+  spy_x_family = "Spy x Family", chainsaw_man = "Chainsaw Man", jujutsu_kaisen = "Jujutsu Kaisen",
+  touhou = "Touhou", vocaloid = "Vocaloid", kantai_collection = "KanColle", girls_frontline = "Girls' Frontline",
+  five_nights_at_freddy_s = "FNAF", five_nights_at_freddys = "FNAF", original = nil,
+}
+local BOORU_COPYRIGHT_KEYS = {}
+for k in pairs(BOORU_COPYRIGHTS) do BOORU_COPYRIGHT_KEYS[#BOORU_COPYRIGHT_KEYS + 1] = k end
+table.sort(BOORU_COPYRIGHT_KEYS, function(a, b) return #a > #b end)
+
+local function title_case_words(s)
+  return (tostring(s):gsub("_", " "):gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b end))
+end
+
+-- "a" / "a and b" / "a, b and c" / "a, b, c and others"
+local function join_names(names)
+  local n = #names
+  if n == 0 then return "" end
+  if n == 1 then return names[1] end
+  if n == 2 then return names[1] .. " and " .. names[2] end
+  if n == 3 then return names[1] .. ", " .. names[2] .. " and " .. names[3] end
+  return names[1] .. ", " .. names[2] .. ", " .. names[3] .. " and others"
+end
+M.join_names = join_names
+
+-- Returns nil for non-booru filenames, otherwise
+-- { characters = {display...}, series = {display...}, artist = "x"|nil, known = bool }
+local function parse_booru_filename(filename)
+  local stem = tostring(filename or ""):match("([^/\\]+)$") or ""
+  stem = (stem:match("^(.*)%.[^.]+$") or stem):lower()
+  if not (stem:match("^__.+__") or stem:find("_drawn_by_", 1, true)) then return nil end
+  stem = stem:gsub("^_+", "")
+  stem = stem:gsub("__sample%-%x+$", ""):gsub("__%x+$", ""):gsub("__.*$", "")
+  local artist
+  local body, art = stem:match("^(.-)_drawn_by_(.+)$")
+  if body then stem, artist = body, art end
+  -- "_and_1_more" etc. stand for copyrights/characters that didn't fit
+  stem = stem:gsub("_and_%d+_more", "")
+  stem = "_" .. stem .. "_"
+
+  -- Peel known series off the end (Danbooru puts copyrights last).
+  local series, seen_series = {}, {}
+  local peeled = true
+  while peeled do
+    peeled = false
+    for _, key in ipairs(BOORU_COPYRIGHT_KEYS) do
+      local suffix = "_" .. key .. "_"
+      if #stem > #suffix and stem:sub(-#suffix) == suffix then
+        local display = BOORU_COPYRIGHTS[key]
+        if display and not seen_series[display] then
+          seen_series[display] = true
+          table.insert(series, 1, display)
+        end
+        stem = stem:sub(1, #stem - #suffix + 1)
+        peeled = true
+        break
+      end
+    end
+  end
+
+  -- Walk the character part left to right: known names first, then
+  -- "_and_" separated leftovers kept whole.
+  local characters, seen_chars, known = {}, {}, false
+  local function add(name)
+    if name ~= "" and not seen_chars[name:lower()] then
+      seen_chars[name:lower()] = true
+      characters[#characters + 1] = name
+    end
+  end
+  local rest = stem:gsub("^_+", ""):gsub("_+$", "")
+  local pending = {}
+  local function flush_pending()
+    if #pending > 0 then
+      local phrase = table.concat(pending, "_")
+      for part in (phrase .. "_and_"):gmatch("(.-)_and_") do
+        if part ~= "" and not part:match("^%d+$") then add(title_case_words(part)) end
+      end
+      pending = {}
+    end
+  end
+  while rest ~= "" do
+    local matched = false
+    for _, key in ipairs(BOORU_CHARACTER_KEYS) do
+      if rest == key or rest:sub(1, #key + 1) == key .. "_" then
+        flush_pending()
+        local entry = BOORU_CHARACTERS[key]
+        add(entry[1])
+        if entry[2] and not seen_series[entry[2]] then
+          seen_series[entry[2]] = true
+          series[#series + 1] = entry[2]
+        end
+        known = true
+        rest = rest:sub(#key + 2)
+        matched = true
+        break
+      end
+    end
+    if not matched then
+      local word, after = rest:match("^([^_]+)_?(.*)$")
+      if word == "and" then
+        flush_pending()
+      else
+        pending[#pending + 1] = word
+      end
+      rest = after or ""
+    end
+  end
+  flush_pending()
+  if #characters == 0 and #series == 0 then return nil end
+  if artist then artist = artist:gsub("_", " ") end
+  return { characters = characters, series = series, artist = artist, known = known or #series > 0 }
+end
+M.parse_booru_filename = parse_booru_filename
+
+local function booru_tags(parsed)
+  local tags = {}
+  for _, c in ipairs(parsed.characters) do tags[#tags + 1] = c:lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "") end
+  for _, s in ipairs(parsed.series) do tags[#tags + 1] = s:lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "") end
+  return tags
 end
 
 local function build_tags(filename, title, description, category_name, subcategory_name, media_kind, size, tags_hint)
@@ -555,9 +761,33 @@ local function heuristic_analysis(filename, mime_type, media_kind, title_hint, d
     })
   )
   local tags = build_tags(filename, clean_hint_title, description_hint, category_name, subcategory_name, media_kind, size, tags_hint)
+  local booru = parse_booru_filename(filename)
+  local confidence = 0.45
+  local subcategory_names = nil
   local title
   if clean_hint_title ~= "" and not is_bad_subject_title(clean_hint_title, category_name, subcategory_name) then
     title = clean_hint_title
+  elseif booru and #booru.characters > 0 then
+    -- Booru filenames carry curated character/series tags: use them whole
+    -- (see parse_booru_filename) instead of splitting names into words.
+    title = join_names(booru.characters) .. " — " .. category_suffix(category_name, media_kind)
+    if booru.artist and booru.artist ~= "" then title = title .. " by " .. booru.artist end
+    title = title:sub(1, 160)
+    -- Replace the word-split filename tokens with the parsed names.
+    local keep = {}
+    for _, t in ipairs(tags) do
+      if t == "landscape" or t == "portrait" or t == "square" or t == "4k" or t == "1440p" or t == "1080p"
+        or t == "video" or t == "gif" then keep[#keep + 1] = t end
+    end
+    tags = merge_tags(booru_tags(booru), merge_tags(keep, normalize_tags(tags_hint)))
+    if booru.known then
+      confidence = 0.62
+      local home_series = nil
+      for _, entry in pairs(BOORU_CHARACTERS) do
+        if entry[1] == booru.characters[1] and entry[2] then home_series = entry[2] break end
+      end
+      subcategory_names = normalize_subcategory_names({ home_series or booru.series[1], booru.characters[1] })
+    end
   else
     title = compose_specific_title("", filename, category_name, subcategory_name, tags, media_kind)
   end
@@ -568,10 +798,10 @@ local function heuristic_analysis(filename, mime_type, media_kind, title_hint, d
     tags = tags,
     category_name = category_name,
     subcategory_name = subcategory_name,
-    subcategory_names = normalize_subcategory_names({}, subcategory_name),
+    subcategory_names = subcategory_names or normalize_subcategory_names({}, subcategory_name),
     is_adult = looks_adult(title, description_hint, tags, filename, mime_type),
-    source = "heuristic",
-    confidence = 0.45,
+    source = (booru and booru.known) and "booru-filename" or "heuristic",
+    confidence = confidence,
     size = size,
   }
 end
@@ -582,6 +812,7 @@ M.heuristic_analysis = heuristic_analysis
 -- ---------------------------------------------------------------------------
 
 local function domain_hint_analysis_from_text(filename, title_hint, description_hint, tags_hint, fallback)
+  if fallback and fallback.source == "booru-filename" then return nil end
   local text = table.concat({ filename_subject_text(filename), title_hint or "", description_hint or "", table.concat(tags_hint or {}, " ") }, " "):lower()
   text = " " .. (text:gsub("[^a-z0-9]+", " ")) .. " "
   if trim(text) == "" then return nil end

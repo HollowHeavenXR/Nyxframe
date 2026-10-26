@@ -237,6 +237,31 @@ export function ResilientImage({ sources = [], fallback = null, diagnostics = nu
   );
 }
 
+// Shows an already-cached small image (usually the 640px grid thumbnail
+// the visitor just saw) right away, blurred, and swaps to the sharp
+// image once it has loaded -- opening a post feels instant instead of
+// sitting on an empty box while the large rendition downloads.
+export function ProgressiveImage({ placeholder = "", sources = [], className = "", wrapperClassName = "", ...props }) {
+  const key = (sources || []).filter(Boolean).join("|");
+  const [loadedKey, setLoadedKey] = useState("");
+  const loaded = loadedKey === key;
+  const showPlaceholder = Boolean(placeholder) && !loaded && !(sources || []).includes(placeholder);
+  return (
+    <div className={`progressive-image ${showPlaceholder ? "has-placeholder" : ""} ${wrapperClassName}`.trim()}>
+      {showPlaceholder ? <img className={`${className} progressive-placeholder`.trim()} src={placeholder} alt="" aria-hidden="true" decoding="async" /> : null}
+      <ResilientImage
+        {...props}
+        className={`${className} progressive-main`.trim()}
+        sources={sources}
+        onLoad={(event) => {
+          setLoadedKey(key);
+          if (typeof props.onLoad === "function") props.onLoad(event);
+        }}
+      />
+    </div>
+  );
+}
+
 export function CollectionMini({ collection }) {
   return (
     <Link className="mini-row" to="/collections">

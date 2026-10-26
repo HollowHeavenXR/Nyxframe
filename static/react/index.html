@@ -12,10 +12,45 @@
     <link rel="apple-touch-icon" href="/static/react/apple-touch-icon.png" />
     <link rel="manifest" href="/static/react/manifest.webmanifest" />
     <title>Nyxframe</title>
-    <script type="module" crossorigin src="/static/react/assets/index-C35TbcQl.js"></script>
+    <script>
+      // Early API fetches (2026-10-26): start the first-screen API calls
+      // while the JS bundle is still downloading instead of after it runs
+      // (~250ms sooner on a cold load). apiFetch() in src/api.js picks these
+      // responses up by path; anything unclaimed within 15s is dropped.
+      // Skipped when a fresh copy is already cached (same keys as api.js).
+      (function () {
+        try {
+          if (window.IMAGE_GALLERY_REMOTE_MODE || location.hostname.endsWith("github.io")) return;
+          if (/[?&]key=gk_/.test(location.search) || sessionStorage.getItem("image_gallery_debug_api_key")) return;
+          if (localStorage.getItem("image_gallery_token")) return;
+          var fresh = function (store, path) {
+            try {
+              var raw = store.getItem("image_gallery_api_cache:v5|" + path + "|anon");
+              return raw && JSON.parse(raw).expires > Date.now();
+            } catch (e) { return false; }
+          };
+          var paths = ["/api/me"];
+          if (!fresh(localStorage, "/api/categories")) paths.push("/api/categories");
+          if (!fresh(localStorage, "/api/tags")) paths.push("/api/tags");
+          if (!fresh(sessionStorage, "/api/live/checks")) paths.push("/api/live/checks");
+          if (location.pathname === "/" && !localStorage.getItem("image_gallery_user")) {
+            var deck = "/api/media?adult=show&limit=25&offset=0&sort=new";
+            if (!fresh(sessionStorage, deck)) paths.push(deck);
+            if (!fresh(sessionStorage, "/api/users/search?limit=12")) paths.push("/api/users/search?limit=12");
+          }
+          var early = {};
+          paths.forEach(function (path) {
+            early[path] = fetch(path, { credentials: "include", headers: { Accept: "application/json" } }).catch(function () { return null; });
+          });
+          window.__nyxEarly = early;
+          setTimeout(function () { window.__nyxEarly = null; }, 15000);
+        } catch (e) { /* optional speed-up only */ }
+      })();
+    </script>
+    <script type="module" crossorigin src="/static/react/assets/index-2w0L2Ef9.js"></script>
     <link rel="modulepreload" crossorigin href="/static/react/assets/vendor-react-BK4TIBJw.js">
     <link rel="modulepreload" crossorigin href="/static/react/assets/vendor-icons-D5E2oE7w.js">
-    <link rel="stylesheet" crossorigin href="/static/react/assets/index-DMnkq5Me.css">
+    <link rel="stylesheet" crossorigin href="/static/react/assets/index-Dz5MoQBV.css">
   </head>
   <body>
     <div id="root"></div>

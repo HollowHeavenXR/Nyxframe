@@ -144,9 +144,9 @@ export async function apiFetch(path, options = {}) {
   if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  let response;
+  let response = await takeEarlyResponse(path, options, token);
   try {
-    response = await fetchWithRemoteRetry(path, options, headers);
+    if (!response) response = await fetchWithRemoteRetry(path, options, headers);
   } catch (error) {
     if (error?.name === "AbortError") {
       if (callerAborted(options)) throw error;
@@ -164,6 +164,21 @@ export async function apiFetch(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+// Responses the inline script in index.html started before this bundle
+// loaded. Each is used once, only for a plain anonymous GET of the same path.
+async function takeEarlyResponse(path, options, token) {
+  const early = window.__nyxEarly;
+  if (!early || token || !Object.prototype.hasOwnProperty.call(early, path)) return null;
+  if (options.method && String(options.method).toUpperCase() !== "GET") return null;
+  const pending = early[path];
+  delete early[path];
+  try {
+    return (await pending) || null;
+  } catch (_error) {
+    return null;
+  }
 }
 
 export async function apiFetchBlob(path, options = {}) {
@@ -256,9 +271,13 @@ export function prefetchApi(path, options = {}) {
   cachedApiFetch(path, { ...options, allowStale: false }).catch(() => {});
 }
 
+// Keys are sorted so the same request always produces the same URL --
+// cachedApiFetch keys on the path, and the home page used to download its
+// first page twice because two callers listed the same params in a
+// different order.
 export function toQuery(params) {
   const query = new URLSearchParams();
-  Object.entries(params).forEach(([key, value]) => {
+  Object.entries(params).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).forEach(([key, value]) => {
     if (value === undefined || value === null || value === "") return;
     query.set(key, String(value));
   });

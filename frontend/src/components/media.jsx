@@ -139,7 +139,7 @@ export const MediaCard = memo(function MediaCard({ ctx, item, index = 0, eager =
         aria-label={item.title || `Open media ${item.id}`}
         onClick={onOpen ? (e) => { if (!e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) { e.preventDefault(); onOpen(); } } : undefined}
       >
-        <div className="thumb-frame">
+        <div className="thumb-frame" style={!item.locked && /^#[0-9a-f]{6}$/i.test(item.dominant_color || "") ? { backgroundColor: item.dominant_color } : undefined}>
           {item.locked ? <Lock size={34} /> : item.media_kind === "video" ? (
             liveVideoPreview ? (
               <video

@@ -22,7 +22,8 @@ export function CategoryPage({ ctx }) {
   const [error, setError] = useState("");
 
   const pageSize = pageSizeFor(ctx.settings);
-  const category = ctx.lookups.categories.find((c) => String(c.id) === String(categoryId));
+  // Links use either the numeric id or the slug (/category/wallpapers).
+  const category = ctx.lookups.categories.find((c) => String(c.id) === String(categoryId) || c.slug === categoryId);
   const subcategories = category?.subcategories || category?.children || [];
 
   const handleItemUpdated = useCallback((item) => setItems((rows) => replaceMedia(rows, item)), []);

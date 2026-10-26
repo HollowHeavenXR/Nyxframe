@@ -620,7 +620,7 @@ export function VideoPlayer({
       playbackStatsRef.current.usingHlsJs = true;
       // Deferred so pages with no video playing never pay hls.js's bundle
       // cost — only actually loaded once a real HLS source needs it.
-      import("hls.js").then(({ default: Hls }) => {
+      import("hls.js/light").then(({ default: Hls }) => {
         if (cancelled || !Hls.isSupported() || videoRef.current !== video) return;
         const hls = new Hls({
           enableWorker: true,

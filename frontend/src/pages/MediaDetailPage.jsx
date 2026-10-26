@@ -6,7 +6,7 @@ import { useLiveRefresh } from "../hooks/useLiveRefresh.js";
 import { useMediaActions } from "../hooks/useMediaActions.js";
 import { MediaActionPanel, MediaControls, MediaEditHistory, MediaEditor } from "../components/media.jsx";
 import { VideoPlayer } from "../components/VideoPlayer.jsx";
-import { Avatar, ChipRow, EmptyState, glassPointerMove, Notice, NotFound, Page, ResilientImage, SkeletonGrid, StatsRow, UserLine } from "../components/ui.jsx";
+import { Avatar, ChipRow, EmptyState, glassPointerMove, Notice, NotFound, Page, ProgressiveImage, ResilientImage, SkeletonGrid, StatsRow, UserLine } from "../components/ui.jsx";
 import { imageQualityUrl, isGifMedia, thumbUrl, videoQualityUrl } from "../utils/media.js";
 import { getPlayerPref, setPlayerPref } from "../utils/playerPrefs.js";
 
@@ -363,7 +363,11 @@ export function MediaDetailPage({ ctx }) {
                   </select>
                 </div>
               ) : null}
-              <ResilientImage className={gif ? "gif-full" : ""} sources={detailImageSources} diagnostics={{ mediaId: media.id, mediaKind: media.media_kind, context: `detail-image-${imageQuality}` }} alt={media.title || ""} fallback={<div className="locked-state"><Notice kind="error">Media preview failed to load.</Notice></div>} />
+              {gif ? (
+                <ResilientImage className="gif-full" sources={detailImageSources} diagnostics={{ mediaId: media.id, mediaKind: media.media_kind, context: `detail-image-${imageQuality}` }} alt={media.title || ""} fallback={<div className="locked-state"><Notice kind="error">Media preview failed to load.</Notice></div>} />
+              ) : (
+                <ProgressiveImage placeholder={thumbUrl(media, 640)} sources={detailImageSources} diagnostics={{ mediaId: media.id, mediaKind: media.media_kind, context: `detail-image-${imageQuality}` }} alt={media.title || ""} decoding="async" fallback={<div className="locked-state"><Notice kind="error">Media preview failed to load.</Notice></div>} />
+              )}
             </>
           )}
         </article>

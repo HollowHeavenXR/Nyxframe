@@ -18,7 +18,12 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) => Promise.all(
       keys.filter((key) => key !== CACHE_VERSION).map((key) => caches.delete(key)),
-    )).then(() => self.clients.claim()),
+    ))
+      // Navigation preload: the browser starts the page request while this
+      // worker boots, instead of after (saves the worker startup time --
+      // tens of ms on phones -- on every page load).
+      .then(() => self.registration.navigationPreload?.enable().catch(() => {}))
+      .then(() => self.clients.claim()),
   );
 });
 
@@ -55,9 +60,15 @@ self.addEventListener("fetch", (event) => {
   if (url.pathname.startsWith("/api/")) return;
 
   if (request.mode === "navigate") {
-    event.respondWith(
-      fetch(request).catch(() => caches.match("/").then((cached) => cached || Response.error())),
-    );
+    event.respondWith((async () => {
+      try {
+        const preloaded = await event.preloadResponse;
+        if (preloaded) return preloaded;
+        return await fetch(request);
+      } catch (_error) {
+        return (await caches.match("/")) || Response.error();
+      }
+    })());
     return;
   }
 

@@ -293,9 +293,18 @@ body[data-background-ready="1"].bg-prev-visible .app-shell::after {
   padding: 28px;
   opacity: 1;
   transition: opacity var(--motion-med), visibility var(--motion-med);
+  /* Fades in only if loading takes longer than ~300ms, so warm loads go
+     straight to the gallery without a flash of the boot screen. */
+  animation: gallery-loading-reveal 180ms ease-out 300ms both;
+}
+
+@keyframes gallery-loading-reveal {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .gallery-loading-screen.is-leaving {
+  animation: none;
   opacity: 0;
   pointer-events: none;
 }
@@ -8743,4 +8752,191 @@ select option {
 
 @media (max-width: 640px) {
   .api-endpoint-row { grid-template-columns: 1fr; gap: 4px; }
+}
+
+/* ProgressiveImage (ui.jsx): cached small image first, sharp one fades in. */
+.progressive-image {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-width: 0;
+}
+.progressive-image > img {
+  grid-area: 1 / 1;
+}
+.progressive-placeholder {
+  filter: blur(4px);
+}
+.progressive-image .progressive-main {
+  transition: opacity 0.18s ease-out;
+}
+.progressive-image.has-placeholder .progressive-main {
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .progressive-image .progressive-main { transition: none; }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   Liquid Glass performance pass (2026-10-26)
+   ─────────────────────────────────────────────────────────────────────────
+   The gallery background is position:fixed, so every element with a live
+   backdrop-filter has to re-blur its slice of it on EVERY scroll frame.
+   A gallery page had ~100-250 of them (each card + each badge sitting on a
+   photo), plus an SVG displacement filter (url(#liquid-glass-refraction))
+   on the sticky topbar, which Chrome runs on the CPU. Measured headless:
+   ~5 fps while scrolling.
+
+   Kept: live blur on the few large/floating surfaces where it is what makes
+   the look (topbar, panels, menus, lightbox, sticky browse bar), at a
+   slightly smaller radius (blur cost grows with radius). Removed: blur on
+   repeated cards and on-photo badges (a slightly denser tinted fill + the
+   same specular edge reads as the same glass), the SVG refraction, and the
+   permanent GPU-layer hint on every .liquid-glass element.
+   ═════════════════════════════════════════════════════════════════════════ */
+:root {
+  --glass-blur: blur(18px) saturate(165%);
+  --glass-blur-soft: blur(10px) saturate(150%);
+  /* Denser stand-in for --glass-fill-soft on surfaces that no longer blur. */
+  --glass-card-fill:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.03)),
+    rgba(14, 18, 28, 0.52);
+}
+
+.gallery-theme-light {
+  --glass-card-fill: linear-gradient(145deg, rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.58));
+}
+
+@media (prefers-color-scheme: light) {
+  .gallery-theme-system {
+    --glass-card-fill: linear-gradient(145deg, rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.58));
+  }
+}
+
+/* Repeated cards/controls: no live blur. */
+.media-card,
+.user-card,
+.studio-item,
+.friend-request,
+.comment,
+.metric,
+.profile-stat-card,
+.collection-candidate,
+.admin-report-row,
+.comment-reply,
+.nav-more-item,
+.collection-detail-head > span,
+.profile-owner-pill,
+.totp-recovery-codes li,
+.api-key-reveal code,
+.similar-media-rail .profile-media-mini.liquid-glass {
+  background: var(--glass-card-fill);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Badges sitting on photos: a darker puck instead of blurring the photo. */
+.kind-badge,
+.trending-rank,
+.detail-stage-nav,
+.quality-bar,
+.studio-select {
+  background: rgba(10, 14, 22, 0.64);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Liquid glass accents: same blur + specular highlight, without the
+   CPU-rendered SVG refraction or a permanent compositor layer each. */
+.liquid-glass {
+  transform: none;
+  will-change: auto;
+  backdrop-filter: blur(16px) saturate(170%);
+  -webkit-backdrop-filter: blur(16px) saturate(170%);
+}
+
+.topbar::before {
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+/* Nested panels and the footer pill sit on an already-blurred surface or
+   the plain background; a tint is enough. */
+.site-footer {
+  background: var(--glass-card-fill);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Full-screen scrims: the dark tint does most of the work; a light blur
+   keeps the depth without re-blurring the whole viewport at 14px. */
+.lb-backdrop,
+.cmdk-backdrop,
+.nav-more-scrim {
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+/* Large content panels (the results panel alone was 1720x1760px, wrapping
+   the whole grid) cost blur in proportion to their area and re-blur on
+   every scroll frame. They get a denser tint instead; the smaller hero,
+   page heads, menus, modals and the two sticky bars keep live glass. */
+:root {
+  --glass-panel-fill:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.035) 55%, rgba(255, 255, 255, 0.06)),
+    rgba(14, 18, 28, 0.56);
+}
+.gallery-theme-light {
+  --glass-panel-fill: linear-gradient(145deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.62));
+}
+@media (prefers-color-scheme: light) {
+  .gallery-theme-system {
+    --glass-panel-fill: linear-gradient(145deg, rgba(255, 255, 255, 0.84), rgba(255, 255, 255, 0.62));
+  }
+}
+.filter-rail,
+.list-panel,
+.detail-panel,
+.content-panel,
+.comments-panel,
+.detail-side,
+.stacked-form,
+.settings-cluster,
+.studio-analytics,
+.leaderboard,
+.collection-inline-panel,
+.collection-add-panel,
+.upload-section,
+.project-card {
+  background: var(--glass-panel-fill);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* .media-stage keeps its own deeper photo-backdrop tint, just no blur. */
+.media-stage {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Entrance animation only for the first screenful of cards: infinite
+   scroll appends 24 at a time mid-scroll, and animating all of them at
+   once was the main remaining source of dropped frames. */
+.media-card:nth-child(n + 13) {
+  animation: none;
+}
+
+/* Keep previous perf-lite / reduced-transparency opt-outs winning. */
+.perf-lite .liquid-glass,
+.perf-lite .lb-backdrop,
+.perf-lite .cmdk-backdrop,
+.perf-lite .nav-more-scrim {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+@media (prefers-reduced-transparency: reduce) {
+  .liquid-glass,
+  .topbar::before {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
 }

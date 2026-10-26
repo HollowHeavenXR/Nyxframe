@@ -16,33 +16,50 @@ export function useMediaActions(ctx, onItemUpdated) {
     return false;
   }, [navigate]);
 
-  const update = useCallback((item) => {
-    clearApiCache();
-    onItemUpdatedRef.current?.(item);
+  // Only the caches a post can appear in -- clearing everything also threw
+  // away categories/tags and prefetched pages after every like.
+  const clearPostCaches = useCallback(() => {
+    ["/api/media", "/api/feed", "/api/users", "/api/collections", "/api/me"].forEach((prefix) => clearApiCache(prefix));
   }, []);
 
+  const update = useCallback((item) => {
+    clearPostCaches();
+    onItemUpdatedRef.current?.(item);
+  }, [clearPostCaches]);
+
+  // Like/bookmark flip in the UI immediately (the round trip through the
+  // tunnel is ~150ms) and roll back if the server rejects it.
   const toggleLike = useCallback(async (item) => {
     if (!requireAuth()) return;
+    const liked = !item.liked_by_me;
+    const count = Number(item.like_count ?? item.likes ?? 0);
+    const optimistic = { ...item, liked_by_me: liked, like_count: Math.max(0, count + (liked ? 1 : -1)) };
+    if ("likes" in item) optimistic.likes = optimistic.like_count;
+    onItemUpdatedRef.current?.(optimistic);
     try {
       const data = await apiFetch(`/api/media/${item.id}/like`, {
         method: "POST",
-        body: JSON.stringify({ liked: !item.liked_by_me }),
+        body: JSON.stringify({ liked }),
       });
-      update(data.media);
+      update(data.media || optimistic);
     } catch (error) {
+      onItemUpdatedRef.current?.(item);
       ctxRef.current.showToast(error.message, "error");
     }
   }, [requireAuth, update]);
 
   const toggleBookmark = useCallback(async (item) => {
     if (!requireAuth()) return;
+    const bookmarked = !item.bookmarked_by_me;
+    onItemUpdatedRef.current?.({ ...item, bookmarked_by_me: bookmarked });
     try {
       const data = await apiFetch(`/api/media/${item.id}/bookmark`, {
         method: "POST",
-        body: JSON.stringify({ bookmarked: !item.bookmarked_by_me }),
+        body: JSON.stringify({ bookmarked }),
       });
-      update(data.media);
+      update(data.media || { ...item, bookmarked_by_me: bookmarked });
     } catch (error) {
+      onItemUpdatedRef.current?.(item);
       ctxRef.current.showToast(error.message, "error");
     }
   }, [requireAuth, update]);

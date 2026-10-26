@@ -3,6 +3,9 @@
 
 package.path = "./lib/?.lua;./lib/?/init.lua;./src/?.lua;" .. package.path
 
+-- Stall detector: must load before anything requires copas (see blockwatch.lua).
+require("blockwatch").install()
+
 local httpd = require("httpd")
 local db = require("db")
 local config = require("config")
@@ -168,6 +171,12 @@ httpd.route("DELETE", "/api/comments/:comment_id", routes.delete_comment)
 httpd.route("POST", "/api/comments/:comment_id/react", routes.react_to_comment_route)
 
 httpd.route("GET", "/api/media/:media_id/thumb", routes.serve_media_thumb)
+-- Same handlers under a .webp path: Cloudflare caches .webp at its edge by
+-- default, so public thumbs/previews are served near the visitor instead of
+-- through the tunnel. Adult/private/expiring items answer with
+-- "Cache-Control: private", which the edge never stores (2026-10-26).
+httpd.route("GET", "/api/media/:media_id/thumb.webp", routes.serve_media_thumb)
+httpd.route("GET", "/api/media/:media_id/preview.webp", routes.serve_media_preview)
 httpd.route("GET", "/api/media/:media_id/watch-progress", routes.watch_progress)
 httpd.route("POST", "/api/media/:media_id/watch-progress", routes.save_watch_progress)
 httpd.route("GET", "/api/media/:media_id/file", routes.serve_media_file)
@@ -454,6 +463,13 @@ if is_primary_worker and settings.media_expiry_sweep_enabled then routes.start_m
 -- 20-100s request stalls). Same primary-worker gate and off-switch
 -- convention as every background loop above.
 if is_primary_worker and settings.thumb_backfill_sweep_enabled then routes.start_thumb_backfill_sweep() end
+
+-- Image rendition warmer (see routes.lua's M.start_image_rendition_warmer):
+-- pre-renders grid/lightbox/detail sizes so nobody waits on a cold render.
+-- Same primary-worker gate and off-switch convention as the loops above.
+local image_warmer_enabled = (os.getenv("GALLERY_ENABLE_IMAGE_WARMER") or "true"):lower()
+image_warmer_enabled = image_warmer_enabled == "true" or image_warmer_enabled == "1" or image_warmer_enabled == "yes"
+if is_primary_worker and image_warmer_enabled then routes.start_image_rendition_warmer() end
 
 httpd.listen(settings.host, settings.port)
 print(string.format("[nyxframe] listening on %s:%d", settings.host, settings.port))

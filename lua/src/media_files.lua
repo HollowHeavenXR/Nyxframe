@@ -402,6 +402,7 @@ end
 local function ffmpeg_prefix()
   return "nice -n 15 ionice -c2 -n6 " .. ffmpeg_bin()
 end
+M.ffmpeg_bin = ffmpeg_bin
 
 -- Renders `src_path` (any image OR video ffmpeg can demux -- a single still
 -- image behaves like a 1-frame video for this purpose, so one helper covers
@@ -481,6 +482,64 @@ function M.render_webp(src_path, dst_path, max_edge, quality, seek)
   end
   os.remove(tmp_dst)
   return false
+end
+
+-- One decode, several WEBP sizes (2026-10-26). Decoding a 4-15MB PNG/JPEG
+-- is most of a render's cost, so the background rendition warmer asks for
+-- the grid thumb, lightbox thumb and detail preview in a single ffmpeg run
+-- (split filter) instead of three. outputs = { {dst=, max_edge=, quality=}, ... }.
+-- Each dst is written via a .tmp.webp + rename, so readers never see a
+-- partial file. Returns the command string (caller decides how to run it)
+-- and a finish() that renames the finished temp files into place.
+function M.render_webp_multi_cmd(src_path, outputs, opts)
+  opts = opts or {}
+  local n = #outputs
+  local parts, maps = {}, {}
+  local labels = {}
+  for i = 1, n do labels[i] = "[s" .. i .. "]" end
+  if n > 1 then
+    parts[#parts + 1] = "[0:v]split=" .. n .. table.concat(labels)
+  end
+  for i, o in ipairs(outputs) do
+    local input = n > 1 and labels[i] or "[0:v]"
+    parts[#parts + 1] = string.format("%sscale='min(%d,iw)':-2:flags=lanczos[o%d]", input, o.max_edge, i)
+    maps[#maps + 1] = string.format("-map '[o%d]' -frames:v 1 -c:v libwebp -compression_level %d -quality %d -f webp %s",
+      i, o.compression_level or 4, math.floor(o.quality), shell_quote(o.dst .. ".tmp.webp"))
+  end
+  local prefix = opts.prefix or ffmpeg_prefix()
+  local cmd = string.format("%s -y -hide_banner -loglevel error -i %s -filter_complex %s %s </dev/null >/dev/null 2>&1",
+    prefix, shell_quote(src_path), shell_quote(table.concat(parts, ";")), table.concat(maps, " "))
+  local function finish()
+    local ok = {}
+    for i, o in ipairs(outputs) do
+      local tmp = o.dst .. ".tmp.webp"
+      local f = io.open(tmp, "rb")
+      local size = f and f:seek("end") or 0
+      if f then f:close() end
+      if size > 0 then
+        ok[i] = os.rename(tmp, o.dst) and true or false
+      else
+        os.remove(tmp)
+        ok[i] = false
+      end
+    end
+    return ok
+  end
+  return cmd, finish
+end
+
+-- Render one WEBP straight from a file on disk (no Lua-side copy of the
+-- original). Returns the rendered bytes or nil.
+function M.render_webp_bytes_from_path(src_path, max_edge, quality)
+  local dst = os.tmpname() .. ".webp"
+  local ok = M.render_webp(src_path, dst, max_edge, quality, nil)
+  if not ok then os.remove(dst); return nil end
+  local f = io.open(dst, "rb")
+  if not f then return nil end
+  local bytes = f:read("*a")
+  f:close()
+  os.remove(dst)
+  return bytes
 end
 
 -- Convenience wrapper: render a WEBP thumb/preview straight from in-memory
