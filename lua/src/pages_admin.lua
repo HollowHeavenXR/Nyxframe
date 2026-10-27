@@ -252,6 +252,17 @@ local function users_section(req)
         </form>
       ]]):format(esc(u.id), u.site_owner and "disabled" or "", esc(u.username))
     end
+    -- Permanent delete (routes.admin_delete_user): the username must be
+    -- typed back, same rule as the app's admin panel.
+    if not u.site_owner then
+      action = action .. ([[
+        <form class="inline" method="POST" action="/admin/actions/delete-user" onsubmit="return confirm('Permanently delete @%s and ALL their posts, comments, likes and collections? This cannot be undone.');">
+          <input type="hidden" name="user_id" value="%s">
+          <input type="text" name="confirm_username" placeholder="Type %s to delete" autocomplete="off" style="width:170px;display:inline-block;">
+          <button class="danger" type="submit">Delete permanently</button>
+        </form>
+      ]]):format(esc(u.username), esc(u.id), esc(u.username))
+    end
     local status_text
     if u.banned_at then
       status_text = "Banned" .. (u.banned_until and (" until " .. format_date(u.banned_until)) or " permanently")
@@ -539,6 +550,19 @@ function M.action_unban(req)
   local status = routes.admin_unban_user(req)
   if status ~= 200 then return redirect_to_admin("error:Could not unban user.", "users") end
   return redirect_to_admin("User unbanned.", "users")
+end
+
+function M.action_delete_user(req)
+  local owner = gate(req)
+  if not owner then return redirect_to_admin("error:Access denied.") end
+  local fields = parse_urlencoded(req.raw_body)
+  req.json = { confirm_username = fields.confirm_username }
+  req.params = { user_id = fields.user_id }
+  local status, body = routes.admin_delete_user(req)
+  if status ~= 200 then
+    return redirect_to_admin("error:" .. tostring(body and body.detail or "Could not delete user."), "users")
+  end
+  return redirect_to_admin("Deleted @" .. tostring(body.username) .. " permanently.", "users")
 end
 
 function M.action_purge_orphans(req)

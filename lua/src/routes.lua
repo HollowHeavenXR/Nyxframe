@@ -328,6 +328,10 @@ local function current_user(req)
   end
   if not auth then return nil, nil, 401, { detail = "Login required" } end
   local user = get_user(auth.id)
+  -- A still-valid token for an account that no longer exists (deleted by
+  -- an admin): treat it as logged out. Previously this fell through with a
+  -- nil user and nil status, so handlers answered 200 with an empty body.
+  if not user then return nil, nil, 401, { detail = "Login required" } end
   if is_actively_banned(user) then
     return nil, nil, 403, { detail = (user and nn(user.ban_reason)) or "Your account has been suspended." }
   end
@@ -13155,6 +13159,233 @@ function M.my_media_picker(req)
     }
   end
   return 200, { items = arr(items), has_more = #(rows or {}) > limit }
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Admin: user management (2026-10-26). Site owner only. A searchable,
+-- sortable user list with activity counts, a per-user summary of what a
+-- permanent delete would remove, and the permanent delete itself.
+--
+-- Deleting a user removes the users row; Postgres ON DELETE CASCADE does
+-- the rest in that one statement -- their posts (and everything on them:
+-- comments, likes, reactions, views...), their comments and likes on other
+-- people's posts, collections, follows, friend requests, blocks, messages,
+-- notifications, saved searches, API keys, push subscriptions. Before that:
+-- status incidents they created move to the acting admin (that FK doesn't
+-- cascade), and DM threads / group chats they created are handed to
+-- another member so the other people's conversations survive (only the
+-- deleted user's own messages go). Files (originals, custom thumbnails,
+-- every per-post cache, avatar renditions) are removed afterwards in the
+-- background; an original shared with another user's post (same bytes) is
+-- kept.
+-- ---------------------------------------------------------------------------
+
+M._ADMIN_USER_SORTS = {
+  newest = "u.created_at DESC",
+  oldest = "u.created_at ASC",
+  posts = "post_count DESC, u.id DESC",
+  last_seen = "u.last_seen_at DESC NULLS LAST",
+  name = "lower(u.username) ASC",
+  storage = "storage_bytes DESC, u.id DESC",
+}
+
+function M._admin_user_row(req, row)
+  row.id = db.toint(row.id, row.id)
+  for _, key in ipairs({ "post_count", "comment_count", "like_count", "collection_count", "storage_bytes" }) do
+    row[key] = db.toint(row[key], 0)
+  end
+  row.site_owner = is_site_owner(row)
+  row.banned = nn(row.banned_at) ~= nil
+  if nn(row.avatar_path) or nn(row.avatar_file_id) then
+    row.avatar_url = request_origin(req) .. "/api/users/" .. row.id .. "/avatar"
+  end
+  row.avatar_path, row.avatar_file_id = nil, nil
+  return row
+end
+
+-- GET /api/admin/users?q=&filter=all|banned|active&sort=newest|oldest|posts|last_seen|name|storage&limit=&offset=
+function M.admin_list_users(req)
+  local owner, status, body = require_site_owner(req)
+  if not owner then return status, body end
+  local q = trim(nn(req.query.q) or ""):sub(1, 80)
+  local filter = nn(req.query.filter) or "all"
+  local order = M._ADMIN_USER_SORTS[nn(req.query.sort) or "newest"] or M._ADMIN_USER_SORTS.newest
+  local limit = math.max(1, math.min(tonumber(req.query.limit) or 50, 100))
+  local offset = math.max(0, tonumber(req.query.offset) or 0)
+  local where, params = { "TRUE" }, {}
+  if q ~= "" then
+    local like = "%" .. q:gsub("([%%_\\])", "\\%1") .. "%"
+    where[#where + 1] = "(u.username ILIKE %s OR u.display_name ILIKE %s OR u.email ILIKE %s)"
+    params[#params + 1], params[#params + 2], params[#params + 3] = like, like, like
+  end
+  if filter == "banned" then where[#where + 1] = "u.banned_at IS NOT NULL" end
+  if filter == "active" then where[#where + 1] = "u.banned_at IS NULL" end
+  params[#params + 1] = tostring(limit + 1)
+  params[#params + 1] = tostring(offset)
+  local rows, err = db.fetchall([[
+    SELECT u.id, u.username, u.display_name, u.email, u.email_verified_at, u.profile_color,
+           u.avatar_path, u.avatar_file_id, u.created_at, u.last_seen_at, u.last_login_at,
+           u.banned_at, u.banned_until, u.ban_reason, u.age_verified_at,
+           (SELECT count(*) FROM media_items m WHERE m.user_id = u.id AND m.deleted_at IS NULL) AS post_count,
+           (SELECT count(*) FROM media_comments c WHERE c.user_id = u.id) AS comment_count,
+           (SELECT count(*) FROM media_likes l WHERE l.user_id = u.id) AS like_count,
+           (SELECT count(*) FROM media_collections col WHERE col.user_id = u.id) AS collection_count,
+           (SELECT COALESCE(sum(m2.file_size), 0) FROM media_items m2 WHERE m2.user_id = u.id) AS storage_bytes
+    FROM users u
+    WHERE ]] .. table.concat(where, " AND ") .. [[
+    ORDER BY ]] .. order .. [[
+    LIMIT %s OFFSET %s
+  ]], unpack(params))
+  if err then return 500, { detail = "Query failed: " .. tostring(err) } end
+  local users = {}
+  for i, row in ipairs(rows or {}) do
+    if i > limit then break end
+    users[#users + 1] = M._admin_user_row(req, row)
+  end
+  local total = db.fetchone("SELECT count(*) AS n FROM users")
+  return 200, { users = arr(users), has_more = #(rows or {}) > limit, total_users = db.toint(total and total.n, 0) }
+end
+
+-- Everything a permanent delete would remove, counted.
+function M._admin_user_counts(user_id)
+  local id = tostring(user_id)
+  local row = db.fetchone([[
+    SELECT
+      (SELECT count(*) FROM media_items WHERE user_id = %s) AS posts,
+      (SELECT count(*) FROM media_items WHERE user_id = %s AND media_kind = 'video') AS videos,
+      (SELECT count(*) FROM media_items WHERE user_id = %s AND media_kind = 'image') AS images,
+      (SELECT COALESCE(sum(file_size), 0) FROM media_items WHERE user_id = %s) AS storage_bytes,
+      (SELECT count(*) FROM media_comments WHERE user_id = %s) AS comments,
+      (SELECT count(*) FROM media_comments c JOIN media_items m ON m.id = c.media_id
+         WHERE m.user_id = %s AND c.user_id <> %s) AS comments_from_others,
+      (SELECT count(*) FROM media_likes WHERE user_id = %s) AS likes,
+      (SELECT count(*) FROM media_bookmarks WHERE user_id = %s) AS bookmarks,
+      (SELECT count(*) FROM media_collections WHERE user_id = %s) AS collections,
+      (SELECT count(*) FROM user_follows WHERE followed_id = %s) AS followers,
+      (SELECT count(*) FROM user_follows WHERE follower_id = %s) AS following,
+      (SELECT count(*) FROM user_messages WHERE sender_id = %s)
+        + (SELECT count(*) FROM thread_messages WHERE sender_id = %s)
+        + (SELECT count(*) FROM group_messages WHERE sender_id = %s) AS messages
+  ]], id, id, id, id, id, id, id, id, id, id, id, id, id, id, id)
+  local out = {}
+  for key, value in pairs(row or {}) do out[key] = db.toint(value, 0) end
+  return out
+end
+
+-- GET /api/admin/users/:user_id
+function M.admin_user_summary(req)
+  local owner, status, body = require_site_owner(req)
+  if not owner then return status, body end
+  local user_id = tonumber(req.params.user_id)
+  local row = user_id and db.fetchone([[
+    SELECT u.id, u.username, u.display_name, u.email, u.email_verified_at, u.profile_color,
+           u.avatar_path, u.avatar_file_id, u.created_at, u.last_seen_at, u.last_login_at,
+           u.banned_at, u.banned_until, u.ban_reason, u.age_verified_at,
+           0 AS post_count, 0 AS comment_count, 0 AS like_count, 0 AS collection_count, 0 AS storage_bytes
+    FROM users u WHERE u.id = %s
+  ]], tostring(user_id))
+  if not row then return 404, { detail = "User not found." } end
+  local user = M._admin_user_row(req, row)
+  local counts = M._admin_user_counts(user_id)
+  user.post_count, user.comment_count, user.like_count = counts.posts, counts.comments, counts.likes
+  user.collection_count, user.storage_bytes = counts.collections, counts.storage_bytes
+  user.can_delete = not user.site_owner and tostring(user_id) ~= tostring(owner.id)
+  return 200, { user = user, counts = counts }
+end
+
+-- Removes the files belonging to a deleted user's posts and avatar. Runs
+-- in its own copas thread after the DB delete; batches the cache globs so a
+-- user with thousands of posts doesn't fork thousands of shells.
+function M._purge_deleted_user_files(media_rows, user_id)
+  local copas = require("copas")
+  local up = M.settings.uploads_dir
+  local roots = { up }
+  if media_files.hot_root then roots[#roots + 1] = media_files.hot_root end
+  local files_removed = 0
+  local globs = {}
+  local function flush()
+    if #globs > 0 then
+      os.execute("nice -n 10 rm -rf " .. table.concat(globs, " ") .. " 2>/dev/null")
+      globs = {}
+    end
+  end
+  for _, row in ipairs(media_rows) do
+    local id = db.toint(row.id, 0)
+    local shard = string.format("%02x", id % 256)
+    local sp = nn(row.storage_path)
+    if sp and not sp:match("^db://") and not sp:find("..", 1, true) then
+      local still_used = db.fetchone("SELECT 1 AS x FROM media_items WHERE storage_path = %s LIMIT 1", sp)
+      if not still_used then
+        for _, root in ipairs(roots) do
+          if os.remove(root .. "/" .. sp) then files_removed = files_removed + 1 end
+        end
+      end
+    end
+    local ct = nn(row.custom_thumb_path)
+    if ct and not ct:find("..", 1, true) then
+      for _, root in ipairs(roots) do os.remove(root .. "/" .. ct) end
+    end
+    if id > 0 then
+      -- Numeric ids only, so these unquoted globs can't be anything else.
+      for _, pattern in ipairs({
+        "/_hls_cache/%d_*", "/_video_cache/%d_*", "/_extras_cache/%d_*", "/_watermark_cache/%d_*",
+        "/_thumb_cache/%d_*", "/_thumb_cache/" .. shard .. "/%d_*",
+        "/_preview_cache/" .. shard .. "/%d_*", "/_original_cache/" .. shard .. "/%d_*",
+      }) do
+        globs[#globs + 1] = up .. string.format(pattern, id)
+      end
+      if #globs >= 400 then flush() end
+    end
+    copas.sleep(0)
+  end
+  globs[#globs + 1] = up .. string.format("/_preview_cache/avatars/%d_*", db.toint(user_id, 0))
+  flush()
+  print(string.format("[nyxframe] deleted user %s: removed %d stored files for %d posts", tostring(user_id), files_removed, #media_rows))
+end
+
+-- POST /api/admin/users/:user_id/delete  { confirm_username }
+function M.admin_delete_user(req)
+  local owner, status, body = require_site_owner(req)
+  if not owner then return status, body end
+  local user_id = tonumber(req.params.user_id)
+  local target = user_id and get_user(tostring(user_id))
+  if not target then return 404, { detail = "User not found." } end
+  if tostring(user_id) == tostring(owner.id) then
+    return 400, { detail = "You can't delete your own account from here." }
+  end
+  if is_site_owner(target) then return 400, { detail = "The site owner's account can't be deleted." } end
+  local payload = json_body(req)
+  if tostring(nn(payload.confirm_username) or "") ~= tostring(target.username) then
+    return 400, { detail = "Type the username exactly to confirm." }
+  end
+
+  local id = tostring(user_id)
+  local counts = M._admin_user_counts(user_id)
+  local media_rows = db.fetchall("SELECT id, storage_path, custom_thumb_path FROM media_items WHERE user_id = %s", id) or {}
+
+  db.execute("UPDATE status_incidents SET created_by = %s WHERE created_by = %s", tostring(owner.id), id)
+  for _, chat in ipairs({ { "message_threads", "message_thread_members", "thread_id" }, { "message_groups", "message_group_members", "group_id" } }) do
+    local tbl, members, key = chat[1], chat[2], chat[3]
+    db.execute(string.format([[
+      UPDATE %s t SET created_by = (
+        SELECT mm.user_id FROM %s mm WHERE mm.%s = t.id AND mm.user_id <> %%s ORDER BY mm.joined_at, mm.user_id LIMIT 1)
+      WHERE t.created_by = %%s
+        AND EXISTS (SELECT 1 FROM %s mm2 WHERE mm2.%s = t.id AND mm2.user_id <> %%s)
+    ]], tbl, members, key, members, key), id, id, id)
+  end
+
+  local ok, err = db.execute("DELETE FROM users WHERE id = %s", id)
+  if not ok then return 500, { detail = "Could not delete the user: " .. tostring(err) } end
+  write_audit_log(owner.id, "delete_user", "user", user_id, string.format(
+    "@%s permanently deleted: %d posts, %d comments, %d likes, %d collections",
+    tostring(target.username), counts.posts or 0, counts.comments or 0, counts.likes or 0, counts.collections or 0))
+
+  require("copas").addthread(function()
+    local pok, perr = pcall(M._purge_deleted_user_files, media_rows, user_id)
+    if not pok then print("[nyxframe] deleted-user file purge failed: " .. tostring(perr)) end
+  end)
+  return 200, { deleted = true, username = target.username, removed = counts }
 end
 
 return M

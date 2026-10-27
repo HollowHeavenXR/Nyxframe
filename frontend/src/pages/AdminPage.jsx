@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { Ban, CheckCircle2, Flag, HardDrive, History, Megaphone, Music, RefreshCw, ShieldAlert, Trash2, Upload, Users, XCircle } from "lucide-react";
+import { Ban, CheckCircle2, ChevronDown, ExternalLink, Flag, HardDrive, History, Megaphone, Music, RefreshCw, ShieldAlert, Trash2, Upload, XCircle } from "lucide-react";
 import { apiFetch, clearApiCache } from "../api.js";
 import { EmptyState, Notice, Page, Segmented, SkeletonList } from "../components/ui.jsx";
 import { formatDate, formatBytes } from "../utils/format.js";
@@ -9,7 +9,7 @@ const STATUS_FILTERS = [["open", "Open"], ["reviewed", "Reviewed"], ["dismissed"
 const TABS = [
   ["reports", "Reports"],
   ["flagged", "Flagged Uploads"],
-  ["users", "Users & Bans"],
+  ["users", "Users"],
   ["storage", "Storage"],
   ["site", "Site Settings"],
   ["music", "Background Music"],
@@ -231,88 +231,260 @@ function FlaggedTab({ ctx }) {
   );
 }
 
+const USER_FILTERS = [["all", "All"], ["active", "Active"], ["banned", "Banned"]];
+const USER_SORTS = [
+  ["newest", "Newest"],
+  ["oldest", "Oldest"],
+  ["posts", "Most posts"],
+  ["last_seen", "Recently active"],
+  ["storage", "Most storage"],
+  ["name", "Name"],
+];
+const BAN_DURATIONS = [["1", "1 day"], ["7", "7 days"], ["30", "30 days"], ["365", "1 year"], ["", "Permanent"]];
+const USERS_PAGE = 40;
+
+function countLabel(value, one, many = `${one}s`) {
+  const n = Number(value) || 0;
+  return `${n.toLocaleString()} ${n === 1 ? one : many}`;
+}
+
 function UsersTab({ ctx }) {
   const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [sort, setSort] = useState("newest");
   const [users, setUsers] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [busyId, setBusyId] = useState("");
-  const showToast = ctx.showToast;
+  const [total, setTotal] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [openId, setOpenId] = useState(null);
+  const requestRef = useRef(0);
 
-  async function search(event) {
-    event?.preventDefault();
+  const load = useCallback(async (offset = 0) => {
+    const requestId = ++requestRef.current;
     setLoading(true);
     try {
-      const data = await apiFetch(`/api/users/search?q=${encodeURIComponent(query)}&limit=30`);
-      setUsers(data.users || []);
+      const params = new URLSearchParams({ filter, sort, limit: String(USERS_PAGE), offset: String(offset) });
+      if (query.trim()) params.set("q", query.trim());
+      const data = await apiFetch(`/api/admin/users?${params}`);
+      if (requestId !== requestRef.current) return;
+      setUsers((current) => (offset ? [...current, ...(data.users || [])] : data.users || []));
+      setHasMore(Boolean(data.has_more));
+      setTotal(data.total_users ?? null);
     } catch (error) {
-      showToast(error.message, "error");
+      if (requestId === requestRef.current) ctx.showToast(error.message, "error");
     } finally {
-      setLoading(false);
+      if (requestId === requestRef.current) setLoading(false);
     }
-  }
+  }, [ctx, filter, query, sort]);
 
   useEffect(() => {
-    search();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const timer = setTimeout(() => load(0), query ? 250 : 0);
+    return () => clearTimeout(timer);
+  }, [load, query]);
 
-  async function ban(user) {
-    const reason = window.prompt(`Reason for banning @${user.username}?`, "");
-    if (reason === null) return;
-    const untilInput = window.prompt("Ban until (YYYY-MM-DD), or leave blank for permanent:", "");
-    setBusyId(String(user.id));
-    try {
-      await apiFetch(`/api/admin/users/${user.id}/ban`, {
-        method: "POST",
-        body: JSON.stringify({ reason, until: untilInput || null }),
-      });
-      showToast(`@${user.username} banned.`, "success");
-      search();
-    } catch (error) {
-      showToast(error.message, "error");
-    } finally {
-      setBusyId("");
-    }
+  function replaceUser(next) {
+    setUsers((current) => current.map((user) => (user.id === next.id ? { ...user, ...next } : user)));
   }
 
-  async function unban(user) {
-    setBusyId(String(user.id));
-    try {
-      await apiFetch(`/api/admin/users/${user.id}/unban`, { method: "POST" });
-      showToast(`@${user.username} unbanned.`, "success");
-      search();
-    } catch (error) {
-      showToast(error.message, "error");
-    } finally {
-      setBusyId("");
-    }
+  function removeUser(id) {
+    setUsers((current) => current.filter((user) => user.id !== id));
+    setTotal((current) => (current ? current - 1 : current));
+    setOpenId(null);
   }
 
   return (
-    <div className="admin-tab">
-      <form className="mini-form settings-inline-form" onSubmit={search}>
-        <label className="field"><span>Search users</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="username or display name" /></label>
-        <div className="form-actions settings-actions"><button type="submit"><Users size={16} />Search</button></div>
-      </form>
-      {loading ? <SkeletonList /> : (
-        <div className="admin-reports-list">
-          {users.map((user) => (
-            <article className="admin-report-row" key={user.id}>
-              <div className="admin-report-body">
-                <strong>{user.display_name || user.username} <small>@{user.username}</small></strong>
-                <p className="muted-copy">{user.banned_at ? `Banned${user.banned_until ? ` until ${formatDate(user.banned_until)}` : " permanently"}${user.ban_reason ? ` — ${user.ban_reason}` : ""}` : "Active account"}</p>
-              </div>
-              <div className="admin-report-actions">
-                {user.banned_at ? (
-                  <button type="button" onClick={() => unban(user)} disabled={busyId === String(user.id)}><CheckCircle2 size={16} />Unban</button>
-                ) : (
-                  <button type="button" className="danger" onClick={() => ban(user)} disabled={busyId === String(user.id) || user.site_owner}><Ban size={16} />Ban</button>
-                )}
-              </div>
-            </article>
-          ))}
-          {!loading && !users.length ? <EmptyState title="No users found" /> : null}
-        </div>
+    <div className="admin-tab admin-users">
+      <div className="admin-users-controls">
+        <label className="field">
+          <span>Search{total != null ? <small className="muted"> · {total.toLocaleString()} accounts</small> : null}</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Username, display name or email" />
+        </label>
+        <Segmented value={filter} onChange={setFilter} options={USER_FILTERS} />
+        <label className="field admin-users-sort">
+          <span>Sort</span>
+          <select value={sort} onChange={(event) => setSort(event.target.value)}>
+            {USER_SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </label>
+      </div>
+
+      <div className="admin-users-list">
+        {users.map((user) => (
+          <AdminUserRow
+            key={user.id}
+            ctx={ctx}
+            user={user}
+            open={openId === user.id}
+            onToggle={() => setOpenId((current) => (current === user.id ? null : user.id))}
+            onChanged={replaceUser}
+            onDeleted={removeUser}
+          />
+        ))}
+        {loading ? <SkeletonList /> : null}
+        {!loading && !users.length ? <EmptyState title="No users found" /> : null}
+        {hasMore && !loading ? (
+          <button type="button" className="admin-users-more" onClick={() => load(users.length)}>Load more</button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function AdminUserRow({ ctx, user, open, onToggle, onChanged, onDeleted }) {
+  const name = user.display_name || user.username;
+  return (
+    <article className={`admin-user-row${open ? " is-open" : ""}`}>
+      <button type="button" className="admin-user-summary" onClick={onToggle} aria-expanded={open}>
+        <span className="admin-user-avatar" style={{ background: user.profile_color || undefined }}>
+          {user.avatar_url ? <img src={user.avatar_url} alt="" loading="lazy" /> : name.slice(0, 1).toUpperCase()}
+        </span>
+        <span className="admin-user-main">
+          <strong>
+            {name} <small>@{user.username}</small>
+            {user.site_owner ? <em className="admin-badge is-owner">Owner</em> : null}
+            {user.banned ? <em className="admin-badge is-banned">Banned</em> : null}
+          </strong>
+          <span className="muted small">
+            {countLabel(user.post_count, "post")} · {countLabel(user.comment_count, "comment")} · {countLabel(user.like_count, "like")} · {formatBytes(user.storage_bytes || 0)}
+          </span>
+          <span className="muted small">
+            Joined {formatDate(user.created_at)}{user.last_seen_at ? ` · last seen ${formatDate(user.last_seen_at)}` : " · never seen"}{user.email ? ` · ${user.email}` : ""}
+          </span>
+        </span>
+        <ChevronDown className="admin-user-chevron" size={18} />
+      </button>
+      {open ? <AdminUserDetail ctx={ctx} user={user} onChanged={onChanged} onDeleted={onDeleted} /> : null}
+    </article>
+  );
+}
+
+function AdminUserDetail({ ctx, user, onChanged, onDeleted }) {
+  const [detail, setDetail] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [banReason, setBanReason] = useState("");
+  const [banDays, setBanDays] = useState("7");
+  const [confirmText, setConfirmText] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      const data = await apiFetch(`/api/admin/users/${user.id}`);
+      setDetail(data);
+      onChanged(data.user);
+    } catch (error) {
+      ctx.showToast(error.message, "error");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  async function act(run, message) {
+    setBusy(true);
+    try {
+      await run();
+      ctx.showToast(message, "success");
+      await refresh();
+    } catch (error) {
+      ctx.showToast(error.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function ban(event) {
+    event.preventDefault();
+    const until = banDays ? new Date(Date.now() + Number(banDays) * 86_400_000).toISOString() : null;
+    act(() => apiFetch(`/api/admin/users/${user.id}/ban`, {
+      method: "POST",
+      body: JSON.stringify({ reason: banReason.trim() || null, until }),
+    }), `@${user.username} banned${until ? ` until ${formatDate(until)}` : " permanently"}.`);
+  }
+
+  async function deleteAccount() {
+    setBusy(true);
+    try {
+      const data = await apiFetch(`/api/admin/users/${user.id}/delete`, {
+        method: "POST",
+        body: JSON.stringify({ confirm_username: confirmText }),
+        timeoutMs: 120_000,
+      });
+      clearApiCache();
+      ctx.showToast(`@${data.username} was permanently deleted.`, "success");
+      onDeleted(user.id);
+    } catch (error) {
+      ctx.showToast(error.message, "error");
+      setBusy(false);
+    }
+  }
+
+  const counts = detail?.counts;
+  const info = detail?.user || user;
+  const canDelete = detail ? detail.user.can_delete : false;
+  const removal = counts ? [
+    countLabel(counts.posts, "post") + (counts.posts ? ` (${counts.videos} video${counts.videos === 1 ? "" : "s"}, ${counts.images} image${counts.images === 1 ? "" : "s"}, ${formatBytes(counts.storage_bytes)})` : ""),
+    countLabel(counts.comments, "comment") + " they wrote",
+    countLabel(counts.comments_from_others, "comment") + " other people left on their posts",
+    countLabel(counts.likes, "like"),
+    countLabel(counts.bookmarks, "bookmark"),
+    countLabel(counts.collections, "collection"),
+    `${countLabel(counts.followers, "follower")} and ${counts.following} followed account${counts.following === 1 ? "" : "s"}`,
+    countLabel(counts.messages, "message") + " they sent",
+  ] : [];
+
+  return (
+    <div className="admin-user-detail">
+      {!detail ? <SkeletonList /> : (
+        <>
+          <div className="admin-user-stats">
+            {[["Posts", counts.posts], ["Comments", counts.comments], ["Likes", counts.likes], ["Collections", counts.collections], ["Followers", counts.followers], ["Storage", formatBytes(counts.storage_bytes)]].map(([label, value]) => (
+              <div key={label}><strong>{typeof value === "number" ? value.toLocaleString() : value}</strong><span>{label}</span></div>
+            ))}
+          </div>
+          <div className="admin-user-links">
+            <Link to={`/users/${encodeURIComponent(info.username)}`}><ExternalLink size={14} />View profile</Link>
+            {info.age_verified_at ? <span className="muted small">Age verified {formatDate(info.age_verified_at)}</span> : <span className="muted small">Age not verified</span>}
+          </div>
+
+          {info.site_owner ? <p className="muted small">This is the site owner's account.</p> : (
+            <section className="admin-user-section">
+              <h4><Ban size={15} />{info.banned ? "Banned" : "Ban"}</h4>
+              {info.banned ? (
+                <>
+                  <p className="small">
+                    {info.banned_until ? `Until ${formatDate(info.banned_until)}` : "Permanently"}{info.ban_reason ? ` — ${info.ban_reason}` : ""}
+                  </p>
+                  <button type="button" disabled={busy} onClick={() => act(() => apiFetch(`/api/admin/users/${user.id}/unban`, { method: "POST" }), `@${user.username} unbanned.`)}>
+                    <CheckCircle2 size={16} />Unban
+                  </button>
+                </>
+              ) : (
+                <form className="admin-ban-form" onSubmit={ban}>
+                  <input value={banReason} onChange={(event) => setBanReason(event.target.value)} maxLength={300} placeholder="Reason (shown to them)" aria-label="Ban reason" />
+                  <select value={banDays} onChange={(event) => setBanDays(event.target.value)} aria-label="Ban length">
+                    {BAN_DURATIONS.map(([value, label]) => <option key={label} value={value}>{label}</option>)}
+                  </select>
+                  <button type="submit" className="danger" disabled={busy}><Ban size={16} />Ban</button>
+                </form>
+              )}
+            </section>
+          )}
+
+          {canDelete ? (
+            <section className="admin-user-section admin-danger-zone">
+              <h4><Trash2 size={15} />Delete account permanently</h4>
+              <p className="small">This can't be undone. Deleting <strong>@{info.username}</strong> removes:</p>
+              <ul className="admin-removal-list">{removal.map((line) => <li key={line}>{line}</li>)}</ul>
+              <p className="small muted">Group chats and conversations they started stay with the other members; only their own messages go.</p>
+              <label className="field">
+                <span>Type <strong>{info.username}</strong> to confirm</span>
+                <input value={confirmText} onChange={(event) => setConfirmText(event.target.value)} autoComplete="off" spellCheck={false} />
+              </label>
+              <button type="button" className="danger" disabled={busy || confirmText !== info.username} onClick={deleteAccount}>
+                <Trash2 size={16} />{busy ? "Deleting…" : `Permanently delete @${info.username}`}
+              </button>
+            </section>
+          ) : null}
+        </>
       )}
     </div>
   );
