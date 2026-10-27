@@ -239,6 +239,13 @@ final class VideoPlayerController: ObservableObject {
             attachPlayer(headers: headers, autoplay: autoplay)
             return
         }
+        // A plain file (direct play, see MediaItem.directPlay) has no
+        // "still transcoding" state to wait out, and probing it with a GET
+        // would download the whole video. Hand it straight to AVPlayer.
+        if !(preflightURL ?? url).path.hasSuffix(".m3u8") {
+            attachPlayer(headers: headers, autoplay: autoplay)
+            return
+        }
         preflightTask = Task { [weak self] in
             guard let self else { return }
             let probeURL = preflightURL ?? url

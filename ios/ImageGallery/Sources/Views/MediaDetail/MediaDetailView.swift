@@ -303,6 +303,12 @@ struct MediaDetailView: View {
         guard components.path.hasSuffix("/file") else { return nil }
         let base = String(components.path.dropLast("/file".count))
         let rendition = (quality == "original" || quality.isEmpty || quality == "high") ? "original" : quality
+        // Direct play: the stored file itself for "original", when it's a
+        // format AVPlayer plays as-is and there are no captions (captions
+        // need a manifest -- see below).
+        if rendition == "original", media.directPlay == true, !hasCaptions {
+            return URL(string: urlString)
+        }
         // With captions available, point at the per-quality MASTER rather
         // than the rendition playlist. AVPlayer cannot side-load a
         // subtitle file the way a browser can attach a <track> -- a

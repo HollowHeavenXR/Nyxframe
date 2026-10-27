@@ -54,6 +54,12 @@ struct MediaItem: Codable, Identifiable, Hashable {
     /// True when the uploader picked their own thumbnail for this video.
     /// Only sent on single-post responses.
     var hasCustomThumbnail: Bool?
+    /// The stored file plays as-is (MP4, 8-bit H.264, AAC/MP3 or no audio),
+    /// so "original" quality can stream it directly instead of the
+    /// server's HLS "original" copy -- a full duplicate of the video the
+    /// server would otherwise have to write. See routes.lua's
+    /// M._direct_playable.
+    var directPlay: Bool?
 
     var isVideo: Bool { mediaKind == "video" }
 

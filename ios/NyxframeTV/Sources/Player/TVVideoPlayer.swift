@@ -17,7 +17,13 @@ enum TVVideoURLs {
     ]
 
     static func playback(_ media: MediaItem, quality: String, captions: Bool) -> URL? {
-        build(media, quality: quality, file: captions ? "master.m3u8" : "playlist.m3u8")
+        // Direct play: the stored file for "original" when it plays as-is
+        // and there are no captions (those need a manifest).
+        let isOriginal = quality.isEmpty || quality == "original" || quality == "high"
+        if isOriginal, media.directPlay == true, !captions, let urlString = media.url {
+            return URL(string: urlString)
+        }
+        return build(media, quality: quality, file: captions ? "master.m3u8" : "playlist.m3u8")
     }
 
     /// The rendition playlist -- what the controller's readiness preflight
