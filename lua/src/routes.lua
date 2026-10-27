@@ -1033,6 +1033,12 @@ local function decode_media_row(row, viewer_can_open_adult, req)
     row.has_custom_thumbnail = nn(row.custom_thumb_path) ~= nil
     row.custom_thumb_path = nil
   end
+  -- direct_play: the web player can use the stored file itself for
+  -- "original" quality instead of an HLS copy (see M._direct_playable).
+  if row.video_codecs ~= nil then
+    row.direct_play = M._direct_playable(row)
+    row.video_codecs = nil
+  end
   row.is_adult = db.tobool(row.is_adult)
   row.adult_marked_by_user = db.tobool(row.adult_marked_by_user)
   row.adult_marked_by_ai = db.tobool(row.adult_marked_by_ai)
@@ -1414,7 +1420,7 @@ function M.list_media(req)
   -- instead of a joined, grouped scan. Same columns, values and order.
   local sql = string.format([[
     SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
            m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
            m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
            m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -1494,7 +1500,7 @@ local function fetch_media_feed(req, viewer_id, extra_clause, extra_params, orde
 
   local sql = string.format([[
     SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
            m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
            m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
            m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -1832,7 +1838,7 @@ function M.my_media(req)
   local sql = string.format(
     [[
       SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
              m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
              m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
              m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url, m.deleted_at,
@@ -1881,7 +1887,7 @@ function M.on_this_day(req)
   local sql = string.format(
     [[
       SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
              m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
              m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
              m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -2135,7 +2141,7 @@ end
 local function fetch_media_by_id(media_id, viewer0)
   local row = db.fetchone([[
     SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+           m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
            m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
            m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
            m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -4016,6 +4022,11 @@ local function finalize_upload(req, user, source, original_filename, form, on_st
   if not row then return 500, { detail = "Could not save media: " .. tostring(insert_err) } end
   local media_id = db.toint(row.id, row.id)
   write_media_subcategories(media_id, resolved_subcategory_ids)
+  if media_kind == "video" then
+    local stored = media_files.legacy_upload_path(M.settings.uploads_dir, media_file.storage_path)
+    local codecs = stored and M._probe_video_codecs(stored)
+    if codecs then db.execute("UPDATE media_items SET video_codecs=%s WHERE id=%s", codecs, tostring(media_id)) end
+  end
   if nn(form.thumbnail_token) then
     local tok, terr = pcall(M._attach_staged_thumbnail, user.id, media_id, form.thumbnail_token, media_kind == "video")
     if not tok then print("[nyxframe] custom thumbnail attach failed (media " .. tostring(media_id) .. "): " .. tostring(terr)) end
@@ -6676,7 +6687,7 @@ function M.collection_detail(req)
     media_rows = db.fetchall(
       string.format([[
         SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-               m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+               m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
                m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
                m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
                m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -7104,7 +7115,7 @@ local function list_profile_media(req, target_id, viewer_id, viewer_can_open_adu
   local rows = db.fetchall(
     string.format([[
       SELECT m.id, m.user_id, m.category_id, m.subcategory_id, m.title, m.description, m.tags,
-             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size,
+             m.media_kind, m.mime_type, m.original_filename, m.storage_path, m.file_size, m.video_codecs,
              m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
              m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
              m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
@@ -9188,62 +9199,40 @@ end
 prewarm_video_thumb = function(media_id, item)
   local ok, err = pcall(function()
     -- A custom thumbnail is rendered on first request (serve_media_thumb);
-    -- a frame grab cached here would hide it. Checked in the DB because
-    -- the backfill sweep's rows don't carry the column.
+    -- checked in the DB because the backfill sweep's rows don't carry it.
     local ct = db.fetchone("SELECT custom_thumb_path FROM media_items WHERE id=%s", tostring(media_id))
     if ct and nn(ct.custom_thumb_path) then return end
-    local width = 520
-    local shard = string.format("%02x", media_id % 256)
-    local cache_path = M.settings.uploads_dir .. "/_thumb_cache/" .. shard .. "/" .. media_id .. "_" .. width .. ".webp"
-    local cache_dir = cache_path:match("^(.*)/[^/]+$")
-    os.execute("mkdir -p " .. shell_quote(cache_dir))
+    item.id = item.id or media_id
+    if M._video_thumb_master(item) then return end
 
-    -- Mirrors M.serve_media_thumb's claim_thumb_job/cache-hit checks: bail
-    -- quietly if a render is already in flight (shouldn't happen this soon
-    -- after upload, but costs nothing to check) or somehow already cached.
-    local existing_marker = io.open(cache_path .. ".pending", "rb")
-    if existing_marker then existing_marker:close() return end
-    local cf = io.open(cache_path, "rb")
-    if cf then cf:close() return end
-
-    -- A YouTube source link wins over the frame-grab -- same precedence
-    -- M.serve_media_thumb's lazy path already gives it. Without this check,
-    -- this prewarm would win the race against that lazy path every time
-    -- (it runs right at upload, long before any viewer's first GET), caching
-    -- the wrong (frame-grabbed) thumbnail permanently -- serve_media_thumb's
-    -- cache-hit check short-circuits before ever reaching its own YouTube
-    -- branch. Fetches the real YouTube thumbnail here instead of skipping
-    -- outright, so the uploader still sees it warm immediately like every
-    -- other video, rather than falling back to the lazy on-first-view path.
-    if item.youtube_video_id and item.youtube_video_id ~= cjson.null and nn(item.youtube_video_id) then
-      local slot_path = acquire_transcode_slot()
-      if not slot_path then return end
-      local marker = cache_path .. ".pending"
-      local out = io.open(marker, "wb")
-      if out then out:write(tostring(os.time())); out:close() end
-      local youtube_thumb = require("youtube_thumb")
-      local ok2, bytes = pcall(youtube_thumb.fetch_best_thumbnail_bytes, item.youtube_video_id)
-      local rendered = ok2 and bytes and media_files.render_webp_from_bytes(bytes, width, 84, nil)
-      if rendered then
-        local out2 = io.open(cache_path, "wb")
-        if out2 then out2:write(rendered); out2:close() end
-      end
-      os.remove(marker)
-      os.execute("rm -f " .. shell_quote(slot_path))
+    -- Makes the master (largest size); every width is cut from it on
+    -- request. YouTube-sourced videos use the YouTube image, no slot.
+    if nn(item.youtube_video_id) then
+      M._make_youtube_master(item)
       return
     end
 
-    local slot_path = acquire_transcode_slot()
-    if not slot_path then return end -- box busy right now; the lazy path still covers this video
+    local master_path = M._video_thumb_master_path(media_id)
+    local marker = master_path .. ".pending"
+    os.execute("mkdir -p " .. shell_quote(master_path:match("^(.*)/[^/]+$")))
+    local existing_marker = io.open(marker, "rb")
+    if existing_marker then existing_marker:close() return end
 
-    local marker = cache_path .. ".pending"
+    -- The frame grab reads the video, so it takes a transcode slot -- and
+    -- waits for one (up to 10 minutes) instead of giving up while the GPU
+    -- warmer has them busy.
+    local copas = require("copas")
+    local slot_path
+    for _ = 1, 120 do
+      slot_path = acquire_transcode_slot()
+      if slot_path then break end
+      copas.sleep(5)
+    end
+    if not slot_path then return end
+
     local out = io.open(marker, "wb")
     if out then out:write(tostring(os.time())); out:close() end
 
-    -- ffmpeg reads the stored file directly. (This used to load the whole
-    -- video into Lua memory via resolve_media_bytes and write a second
-    -- full copy to _original_cache just to grab one frame -- hundreds of
-    -- MB of GC heap and disk writes per upload.)
     local src_path = M._image_source_path(item)
     if not src_path then
       local content = resolve_media_bytes(item)
@@ -9254,11 +9243,11 @@ prewarm_video_thumb = function(media_id, item)
       end
       src_path = original_bytes_cache_path(media_id, item)
     end
-    local tmp_dst = cache_path .. ".tmp.webp"
-    local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, width, 84, 0.35)
+    local tmp_dst = master_path .. ".tmp.webp"
+    local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, M._THUMB_MASTER_WIDTH, 90, 0.35)
     os.execute(string.format(
       "( %s; if [ -s %s ]; then mv -f %s %s; fi; rm -f %s %s ) >/dev/null 2>&1 &",
-      render_cmd, shell_quote(tmp_dst), shell_quote(tmp_dst), shell_quote(cache_path), shell_quote(marker), shell_quote(slot_path)
+      render_cmd, shell_quote(tmp_dst), shell_quote(tmp_dst), shell_quote(master_path), shell_quote(marker), shell_quote(slot_path)
     ))
   end)
   if not ok then
@@ -9378,7 +9367,10 @@ function M.serve_media_thumb(req)
     return 403, { detail = "Age verification required for this 18+ post." }
   end
 
-  local width = math.max(160, math.min(tonumber(req.query.w) or 520, 1440))
+  -- Snapped up to a fixed set of widths, so the handful of sizes the site
+  -- and apps ask for share cache files instead of each odd width being
+  -- rendered (and stored) separately.
+  local width = M._snap_thumb_width(tonumber(req.query.w) or 520)
   local shard = string.format("%02x", media_id % 256)
   local media_kind = tostring(item.media_kind or ""):lower()
 
@@ -9411,6 +9403,25 @@ function M.serve_media_thumb(req)
     local rendered = M._render_custom_thumb(item, width, cache_path)
     if rendered then
       return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
+    end
+  end
+
+  -- Every width of a video thumbnail is cut from one master image (made
+  -- once: the YouTube source image, or a frame grab) -- a small image on
+  -- the fast disk, rendered inline. Before, each new width re-fetched from
+  -- YouTube or re-read the video from the USB drive, and only while one of
+  -- the two transcode slots was free; with the GPU warmer busy, new widths
+  -- kept answering with the placeholder.
+  if media_kind == "video" then
+    local master = M._video_thumb_master(item)
+    if not master and nn(item.youtube_video_id) then
+      master = M._make_youtube_master(item)
+    end
+    if master then
+      local rendered = M._render_thumb_from_image(master, width, cache_path)
+      if rendered then
+        return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
+      end
     end
   end
 
@@ -9455,7 +9466,7 @@ function M.serve_media_thumb(req)
     -- already used for the "couldn't render" case immediately. The real
     -- thumbnail takes over on whichever later request finds the cache file
     -- in place -- same contract the frontend already handles today.
-    local marker = cache_path .. ".pending"
+    local marker = M._video_thumb_master_path(media_id) .. ".pending"
     local cache_dir = cache_path:match("^(.*)/[^/]+$")
     -- Must exist before claim_thumb_job's io.open(marker, "wb") below --
     -- a never-before-rendered shard directory doesn't exist yet, which
@@ -9506,11 +9517,13 @@ function M.serve_media_thumb(req)
         local src_path = M._image_source_path(item)
         if not src_path and resolve_media_bytes(item) then src_path = original_bytes_cache_path(media_id, item) end
         if src_path then
-          local tmp_dst = cache_path .. ".tmp.webp"
-          local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, width, 84, 0.35)
+          -- Grab the master (largest size) once; every width is cut from it.
+          local master_path = M._video_thumb_master_path(media_id)
+          local tmp_dst = master_path .. ".tmp.webp"
+          local render_cmd = media_files.render_webp_scene_aware_cmd(src_path, tmp_dst, M._THUMB_MASTER_WIDTH, 90, 0.35)
           os.execute(string.format(
             "( %s; if [ -s %s ]; then mv -f %s %s; fi; rm -f %s %s ) >/dev/null 2>&1 &",
-            render_cmd, shell_quote(tmp_dst), shell_quote(tmp_dst), shell_quote(cache_path), shell_quote(marker), shell_quote(slot_path)
+            render_cmd, shell_quote(tmp_dst), shell_quote(tmp_dst), shell_quote(master_path), shell_quote(marker), shell_quote(slot_path)
           ))
         else
           os.remove(marker)
@@ -11052,7 +11065,7 @@ local function warm_one_pass(cursor_id)
 
   local rows = db.fetchall([[
     SELECT id, user_id, storage_path, mime_type, original_filename, file_size,
-           media_kind, updated_at, created_at, content_sha256
+           media_kind, updated_at, created_at, content_sha256, video_codecs
     FROM media_items
     WHERE media_kind='video' AND deleted_at IS NULL AND id > %s
     ORDER BY id ASC
@@ -11106,8 +11119,11 @@ local function warm_one_pass(cursor_id)
     -- Original HLS is a remux and deliberately has no size cap. Warm it for
     -- large uploads too, otherwise those videos always begin with a cold
     -- playlist even though this rendition does not require re-encoding.
+    -- No "original" copy for videos the web player plays straight from
+    -- the stored file (direct_play): it would be a full duplicate of the
+    -- video on the uploads drive. Made on demand if something asks for it.
     local hls_dir = hls_variant_dir(item.id, "original", digest_seed)
-    if not transcode.warmer.variant_ready(hls_dir) then
+    if not M._direct_playable(item) and not transcode.warmer.variant_ready(hls_dir) then
       return transcode.warmer.try_launch(item, "original"), last_id
     end
   end
@@ -13024,6 +13040,11 @@ end
 function M._render_custom_thumb(item, width, cache_path)
   local src = media_files.legacy_upload_path(M.settings.uploads_dir, nn(item.custom_thumb_path))
   if not src then return nil end
+  return M._render_thumb_from_image(src, width, cache_path)
+end
+
+-- Renders `src` (an image) at `width` into cache_path and returns the bytes.
+function M._render_thumb_from_image(src, width, cache_path)
   local bytes = media_files.render_webp_bytes_from_path(src, width, 86)
   if not bytes then return nil end
   os.execute("mkdir -p " .. shell_quote(cache_path:match("^(.*)/[^/]+$")))
@@ -13386,6 +13407,130 @@ function M.admin_delete_user(req)
     if not pok then print("[nyxframe] deleted-user file purge failed: " .. tostring(perr)) end
   end)
   return 200, { deleted = true, username = target.username, removed = counts }
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Video thumbnail masters (2026-10-26): one large image per video, made
+-- once, from which every requested width is cut (serve_media_thumb).
+-- ---------------------------------------------------------------------------
+M._THUMB_MASTER_WIDTH = 1440
+M._THUMB_WIDTHS = { 160, 240, 320, 420, 520, 640, 720, 960, 1024, 1280, 1440 }
+
+function M._snap_thumb_width(requested)
+  requested = math.max(160, math.min(requested or 520, 1440))
+  for _, w in ipairs(M._THUMB_WIDTHS) do
+    if w >= requested then return w end
+  end
+  return 1440
+end
+
+function M._video_thumb_master_path(media_id)
+  local shard = string.format("%02x", media_id % 256)
+  return M.settings.uploads_dir .. "/_thumb_cache/" .. shard .. "/" .. media_id .. "_master.webp"
+end
+
+-- Path of an existing master, else nil. Also adopts a video's existing
+-- largest cached width as its master, so older videos (thumbnails made
+-- before masters existed) don't need a new frame grab.
+function M._video_thumb_master(item)
+  local media_id = db.toint(item.id, 0)
+  local path = M._video_thumb_master_path(media_id)
+  local f = io.open(path, "rb")
+  if f then
+    f:close()
+    return path
+  end
+  local shard = string.format("%02x", media_id % 256)
+  for i = #M._THUMB_WIDTHS, 1, -1 do
+    local w = M._THUMB_WIDTHS[i]
+    if w < 520 then break end
+    local candidate = M.settings.uploads_dir .. "/_thumb_cache/" .. shard .. "/" .. media_id .. "_" .. w .. ".webp"
+    local cf = io.open(candidate, "rb")
+    if cf then
+      cf:close()
+      return candidate
+    end
+  end
+  return nil
+end
+
+-- Fetches the YouTube source thumbnail once and stores it as the master.
+function M._make_youtube_master(item)
+  local media_id = db.toint(item.id, 0)
+  local ok, bytes = pcall(require("youtube_thumb").fetch_best_thumbnail_bytes, item.youtube_video_id)
+  if not ok or not bytes then return nil end
+  local rendered = media_files.render_webp_from_bytes(bytes, M._THUMB_MASTER_WIDTH, 90, nil)
+  if not rendered then return nil end
+  local path = M._video_thumb_master_path(media_id)
+  os.execute("mkdir -p " .. shell_quote(path:match("^(.*)/[^/]+$")))
+  local tmp = path .. ".tmp." .. tostring(math.random(100000, 999999))
+  local f = io.open(tmp, "wb")
+  if not f then return nil end
+  f:write(rendered)
+  f:close()
+  os.rename(tmp, path)
+  return path
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Video codecs / direct play (2026-10-26). See scripts/pg_add_video_codecs.sql.
+-- ---------------------------------------------------------------------------
+
+-- "<codec>/<pix_fmt>[+<audio codec>]" for a video file, or nil.
+function M._probe_video_codecs(path)
+  local out = os.tmpname()
+  os.execute(string.format(
+    "%s -v error -show_entries stream=codec_type,codec_name,pix_fmt -of compact=p=0 %s > %s 2>/dev/null",
+    os.getenv("GALLERY_FFPROBE_BIN") or "ffprobe", shell_quote(path), shell_quote(out)))
+  local f = io.open(out, "rb")
+  local text = f and f:read("*a") or ""
+  if f then f:close() end
+  os.remove(out)
+  local video, audio
+  for line in text:gmatch("[^\n]+") do
+    local name = line:match("codec_name=([%w_]+)")
+    local kind = line:match("codec_type=(%a+)")
+    if kind == "video" and not video and name then
+      video = name .. "/" .. (line:match("pix_fmt=([%w_]+)") or "?")
+    elseif kind == "audio" and not audio and name then
+      audio = name
+    end
+  end
+  if not video then return nil end
+  return audio and (video .. "+" .. audio) or video
+end
+
+-- Plays in every current browser straight from the file: MP4 with 8-bit
+-- H.264 video and AAC/MP3 audio (or none).
+function M._direct_playable(row)
+  if tostring(row.media_kind or "") ~= "video" then return false end
+  local mime = tostring(row.mime_type or ""):lower()
+  if mime ~= "video/mp4" and mime ~= "video/x-m4v" then return false end
+  local codecs = nn(row.video_codecs)
+  if not codecs then return false end
+  local video, audio = codecs:match("^([^+]+)%+?(.*)$")
+  if video ~= "h264/yuv420p" and video ~= "h264/yuvj420p" then return false end
+  return audio == "" or audio == "aac" or audio == "mp3"
+end
+
+-- Primary worker, once per start: probes videos that have no codecs yet.
+function M.start_video_codec_backfill()
+  local copas = require("copas")
+  copas.addthread(function()
+    copas.sleep(60)
+    local rows = db.fetchall("SELECT id, storage_path FROM media_items WHERE media_kind='video' AND video_codecs IS NULL AND deleted_at IS NULL ORDER BY id DESC LIMIT 500") or {}
+    local done = 0
+    for _, row in ipairs(rows) do
+      local path = media_files.legacy_upload_path(M.settings.uploads_dir, nn(row.storage_path))
+      local codecs = path and M._probe_video_codecs(path)
+      db.execute("UPDATE media_items SET video_codecs=%s WHERE id=%s", codecs or "unknown", tostring(db.toint(row.id, 0)))
+      done = done + 1
+      copas.sleep(0.5)
+    end
+    if done > 0 then print(string.format("[nyxframe] video codec backfill: probed %d videos", done)) end
+  end)
 end
 
 return M

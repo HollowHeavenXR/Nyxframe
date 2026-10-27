@@ -489,6 +489,7 @@ routes.configure_storage()
 if is_primary_worker then
   routes.start_upload_job_recovery()
   routes.start_hot_tier_mover()
+  routes.start_video_codec_backfill()
 end
 
 httpd.listen(settings.host, settings.port)

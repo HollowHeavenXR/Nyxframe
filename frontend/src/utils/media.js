@@ -246,6 +246,12 @@ export function videoQualityUrl(item, quality = "original") {
       return absolute ? parsed.toString() : parsed.pathname + parsed.search + parsed.hash;
     }
     const rendition = (!quality || quality === "original" || quality === "high") ? "original" : quality;
+    // Browser-safe MP4 (H.264/AAC, flagged direct_play by the server):
+    // play the stored file itself, Range-streamed. The HLS "original" would
+    // be a full copy of the video written to the uploads drive first. If a
+    // browser can't decode it anyway, VideoPlayer's error path drops to a
+    // transcoded quality the same as before.
+    if (rendition === "original" && item.direct_play) return item.url;
     parsed.pathname = `${base}/hls/${rendition}/playlist.m3u8`;
     return absolute ? parsed.toString() : parsed.pathname + parsed.search + parsed.hash;
   } catch (_error) {
