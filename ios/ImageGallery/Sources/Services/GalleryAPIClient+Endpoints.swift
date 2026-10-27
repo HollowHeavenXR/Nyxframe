@@ -313,6 +313,8 @@ extension GalleryAPIClient {
         var autoAI: Bool
         var publishAt: String?
         var checkSiteDuplicates: Bool = true
+        /// From `stageUploadThumbnail` -- a custom thumbnail for a video.
+        var thumbnailToken: String? = nil
     }
 
     /// Internal, not private -- `BackgroundUploadManager` (which does the
@@ -334,6 +336,7 @@ extension GalleryAPIClient {
         if let categoryId = fields.categoryId { form["category_id"] = String(categoryId) }
         if let publishAt = fields.publishAt, !publishAt.isEmpty { form["publish_at"] = publishAt }
         if fields.checkSiteDuplicates { form["check_site_duplicates"] = "true" }
+        if let token = fields.thumbnailToken, !token.isEmpty { form["thumbnail_token"] = token }
         return form
     }
 

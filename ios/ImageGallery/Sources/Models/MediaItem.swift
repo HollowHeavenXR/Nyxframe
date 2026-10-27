@@ -51,6 +51,9 @@ struct MediaItem: Codable, Identifiable, Hashable {
     var createdAt: String?
     var deletedAt: String?
     var yearsAgo: Int?
+    /// True when the uploader picked their own thumbnail for this video.
+    /// Only sent on single-post responses.
+    var hasCustomThumbnail: Bool?
 
     var isVideo: Bool { mediaKind == "video" }
 

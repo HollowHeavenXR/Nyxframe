@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// Full post editor, mirroring the web app's `MediaEditor` in
@@ -27,6 +28,10 @@ struct MediaEditSheet: View {
     @State private var isAdult = false
     @State private var categories: [CategorySummary] = []
     @State private var isSaving = false
+    @State private var showingPostPicker = false
+    @State private var thumbnailItem: PhotosPickerItem?
+    @State private var thumbnailBusy = false
+    @State private var thumbnailError: String?
 
     private var selectedCategory: CategorySummary? {
         categories.first { $0.id == categoryId }
@@ -41,6 +46,14 @@ struct MediaEditSheet: View {
                         .lineLimit(3...8)
                     TextField("Tags (comma separated)", text: $tags)
                         .textInputAutocapitalization(.never)
+                    Button {
+                        showingPostPicker = true
+                    } label: {
+                        Label("Reuse tags from one of your posts", systemImage: "tag.circle")
+                    }
+                }
+                if let media = viewModel.media, media.isVideo {
+                    thumbnailSection(media)
                 }
                 Section("Category") {
                     Picker("Category", selection: $categoryId) {
@@ -90,6 +103,92 @@ struct MediaEditSheet: View {
                 }
             }
             .task { await prepare() }
+            .sheet(isPresented: $showingPostPicker) {
+                PostPickerSheet { picked, replace, _ in
+                    tags = TagMerge.apply(picked, to: tags, replace: replace).tags
+                }
+            }
+            .onChange(of: thumbnailItem) { item in
+                guard let item else { return }
+                Task { await uploadThumbnail(item) }
+            }
+        }
+    }
+
+    // Applies immediately (separate endpoint), unlike the rest of the form,
+    // which waits for Save.
+    @ViewBuilder
+    private func thumbnailSection(_ media: MediaItem) -> some View {
+        Section {
+            HStack(spacing: 14) {
+                CachedAsyncImage(url: media.thumbUrl.flatMap { URL(string: $0) }) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    default:
+                        Rectangle().fill(Color.secondary.opacity(0.15))
+                    }
+                }
+                .frame(width: 112, height: 63)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(media.hasCustomThumbnail == true ? "Custom" : "Automatic").font(.subheadline.weight(.semibold))
+                    if thumbnailBusy {
+                        ProgressView()
+                    }
+                }
+            }
+            PhotosPicker(selection: $thumbnailItem, matching: .images) {
+                Label("Choose a new thumbnail", systemImage: "photo")
+            }
+            .disabled(thumbnailBusy)
+            if media.hasCustomThumbnail == true {
+                Button(role: .destructive) {
+                    Task { await resetThumbnail(media) }
+                } label: {
+                    Label("Use automatic thumbnail", systemImage: "arrow.uturn.backward")
+                }
+                .disabled(thumbnailBusy)
+            }
+            if let thumbnailError {
+                Text(thumbnailError).font(.footnote).foregroundStyle(.red)
+            }
+        } header: {
+            Text("Thumbnail")
+        } footer: {
+            Text("Thumbnail changes apply right away.")
+        }
+    }
+
+    private func uploadThumbnail(_ item: PhotosPickerItem) async {
+        guard let mediaId = viewModel.media?.id else { return }
+        thumbnailBusy = true
+        thumbnailError = nil
+        defer {
+            thumbnailBusy = false
+            thumbnailItem = nil
+        }
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let jpeg = ThumbnailImageTools.jpegData(from: data) else {
+            thumbnailError = "Couldn't use that photo. Try another one."
+            return
+        }
+        do {
+            viewModel.media = try await GalleryAPIClient.shared.setMediaThumbnail(mediaId: mediaId, jpegData: jpeg)
+            Haptics.light()
+        } catch {
+            thumbnailError = error.localizedDescription
+        }
+    }
+
+    private func resetThumbnail(_ media: MediaItem) async {
+        thumbnailBusy = true
+        thumbnailError = nil
+        defer { thumbnailBusy = false }
+        do {
+            viewModel.media = try await GalleryAPIClient.shared.clearMediaThumbnail(mediaId: media.id)
+        } catch {
+            thumbnailError = error.localizedDescription
         }
     }
 

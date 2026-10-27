@@ -251,6 +251,13 @@ struct YouView: View {
             door("Settings", icon: "gearshape.fill", tint: .gray) {
                 SettingsView()
             }
+            // Site owner only (the server enforces it too).
+            if user.siteOwner == true {
+                separator
+                door("Admin · Users", icon: "shield.lefthalf.filled", tint: .red) {
+                    AdminUsersView()
+                }
+            }
         }
         .nyxGlass(radius: Nyx.Radius.card)
     }

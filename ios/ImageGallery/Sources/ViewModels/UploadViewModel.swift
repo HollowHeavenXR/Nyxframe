@@ -65,6 +65,8 @@ final class UploadViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var possibleDuplicates: [DuplicateMatch] = []
     @Published var isAnalyzing = false
+    /// Custom thumbnail for a video upload, as JPEG (nil = automatic).
+    @Published var customThumbnail: Data?
 
     private let api = GalleryAPIClient.shared
     private var progressCancellable: AnyCancellable?
@@ -220,7 +222,7 @@ final class UploadViewModel: ObservableObject {
             publishAtString = formatter.string(from: publishAt)
         }
 
-        let fields = GalleryAPIClient.UploadFields(
+        var fields = GalleryAPIClient.UploadFields(
             title: title,
             description: description,
             categoryId: nil,
@@ -253,6 +255,18 @@ final class UploadViewModel: ObservableObject {
             sourceURL = tempURL
         } else {
             return false
+        }
+
+        // A custom thumbnail goes up first (small, foreground); its token
+        // rides along with the upload and the server attaches it once the
+        // post exists -- even if this upload finishes in the background.
+        if isVideo, let customThumbnail {
+            do {
+                fields.thumbnailToken = try await api.stageUploadThumbnail(jpegData: customThumbnail)
+            } catch {
+                errorMessage = "Couldn't upload the thumbnail: \(error.localizedDescription)"
+                return false
+            }
         }
 
         isUploading = true
@@ -293,6 +307,7 @@ final class UploadViewModel: ObservableObject {
     /// Removes any picked-video temp file so a "change file" tap or a reset
     /// doesn't leak temp files across selections.
     private func clearPickedFile() {
+        customThumbnail = nil
         pickedData = nil
         if let pickedFileURL {
             try? FileManager.default.removeItem(at: pickedFileURL)

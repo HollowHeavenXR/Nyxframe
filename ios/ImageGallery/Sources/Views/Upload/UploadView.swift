@@ -5,6 +5,7 @@ import UIKit
 struct UploadView: View {
     @StateObject private var viewModel = UploadViewModel()
     @State private var showingQueued = false
+    @State private var showingPostPicker = false
 
     // The backend (lua/src/config.lua's max_tags_per_upload/max_tag_length,
     // defaults 12/32) silently truncates instead of rejecting an
@@ -100,6 +101,20 @@ struct UploadView: View {
                         if let tagsWarning {
                             Text(tagsWarning).font(.footnote).foregroundStyle(.secondary)
                         }
+                        Button {
+                            showingPostPicker = true
+                        } label: {
+                            Label("Reuse tags from one of your posts", systemImage: "tag.circle")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .buttonStyle(.borderless)
+                    }
+
+                    if viewModel.isVideo {
+                        ThumbnailPickerCard(
+                            thumbnail: $viewModel.customThumbnail,
+                            videoURL: viewModel.pickedFileURL
+                        )
                     }
 
                     UploadCardSection("Visibility", "eye") {
@@ -141,6 +156,12 @@ struct UploadView: View {
         }
         .navigationTitle("Upload")
         .nyxScreen()
+        .sheet(isPresented: $showingPostPicker) {
+            PostPickerSheet { tags, replace, _ in
+                viewModel.tags = TagMerge.apply(tags, to: viewModel.tags, replace: replace).tags
+                Haptics.light()
+            }
+        }
         .task { await viewModel.loadCategories() }
         // "Queued", not "complete" -- the transfer now runs in
         // BackgroundUploadManager independent of this screen (see
