@@ -304,12 +304,16 @@ function App() {
   }, [navigate, refreshLookups, showToast]);
 
   const refreshMe = useCallback(async () => {
+    // A 401 only means "logged out" for the token this request carried. If
+    // the user logged in while it was in flight (a check started anonymously
+    // finishing after login), clearing here would sign them straight out.
+    const sentToken = readToken();
     try {
       const data = await apiFetch("/api/me");
       setSessionUser(data.user);
       if (!readToken() && data.user) setTokenState("cookie-session");
     } catch (error) {
-      if (error.status === 401) {
+      if (error.status === 401 && readToken() === sentToken) {
         writeToken("");
         writeStoredUser(null);
         setTokenState("");

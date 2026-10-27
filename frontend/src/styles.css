@@ -8076,18 +8076,328 @@ select option {
   justify-self: start;
 }
 
-.upload-prefill-tags-row {
+/* --- Reuse tags: post picker (components/PostPicker.jsx) --- */
+.reuse-tags-open {
+  justify-self: start;
+}
+
+.post-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 220;
   display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: rgba(3, 6, 10, 0.62);
+}
+
+.post-picker {
+  display: flex;
+  flex-direction: column;
+  width: min(880px, 100%);
+  height: min(80vh, 760px);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  /* Solid page colour, not the translucent --panel: a grid of thumbnails
+     over the busy upload form behind it was hard to read. */
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  animation: cmdk-in 150ms ease both;
+}
+
+.post-picker-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 10px;
+}
+
+.post-picker-head h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.post-picker-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.post-picker-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 18px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--glass-input);
+  color: var(--muted);
+}
+
+.post-picker-search input {
+  flex: 1;
+  min-width: 0;
+  min-height: 42px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text);
+  font: inherit;
+}
+
+.post-picker-search .icon-button {
+  min-height: 28px;
+  padding: 0 6px;
+}
+
+.post-picker-mode {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 10px 18px;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.post-picker-mode label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* The global input rule (full width, 40px tall) would make these huge. */
+.post-picker-mode input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+
+.post-picker-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px 18px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.post-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.post-picker-card {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  align-content: start;
+  justify-content: stretch;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+
+.post-picker-card:hover,
+.post-picker-card:focus-visible {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.post-picker-thumb {
+  position: relative;
+  display: block;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--glass-input);
+}
+
+.post-picker-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.post-picker-kind {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+}
+
+.post-picker-title {
+  overflow: hidden;
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.post-picker-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.post-picker-tag {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--glass-input);
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.post-picker-tag.is-more {
+  color: var(--text);
+}
+
+.post-picker-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.post-picker-empty,
+.post-picker-loading {
+  margin: 24px 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .post-picker-backdrop {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .post-picker {
+    width: 100%;
+    height: 100%;
+    border-radius: 0;
+    border: 0;
+  }
+
+  .post-picker-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+
+/* --- Video thumbnail (components/ThumbnailPicker.jsx) --- */
+.thumb-chooser {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  background: var(--glass-control);
+}
+
+.thumb-chooser-preview {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--glass-input);
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.thumb-chooser-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.thumb-chooser-body h3 {
+  margin: 0 0 4px;
+  font-size: 0.98rem;
+}
+
+.thumb-chooser-body p {
+  margin: 0 0 10px;
+}
+
+.thumb-chooser-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
-.upload-prefill-tags-row input {
-  flex: 1;
-  min-width: 0;
+.thumb-chooser-actions label.button-link {
+  position: relative;
+  cursor: pointer;
 }
 
-.upload-prefill-tags-row button {
-  flex-shrink: 0;
+.thumb-chooser-actions input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.thumb-edit-row {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.thumb-edit-preview {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  background: var(--glass-input);
+}
+
+@media (max-width: 520px) {
+  .thumb-chooser,
+  .thumb-edit-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .upload-duplicate-warning p {

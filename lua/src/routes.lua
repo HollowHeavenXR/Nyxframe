@@ -1023,6 +1023,12 @@ end
 
 local function decode_media_row(row, viewer_can_open_adult, req)
   numify_media(row)
+  -- Only rows that selected the column (single-post fetches) report it;
+  -- the stored path itself is never sent to clients.
+  if row.custom_thumb_path ~= nil then
+    row.has_custom_thumbnail = nn(row.custom_thumb_path) ~= nil
+    row.custom_thumb_path = nil
+  end
   row.is_adult = db.tobool(row.is_adult)
   row.adult_marked_by_user = db.tobool(row.adult_marked_by_user)
   row.adult_marked_by_ai = db.tobool(row.adult_marked_by_ai)
@@ -2129,7 +2135,7 @@ local function fetch_media_by_id(media_id, viewer0)
            m.views, m.downloads, m.created_at, m.updated_at, m.visibility,
            m.comments_enabled, m.downloads_enabled, m.pinned_at, m.is_adult,
            m.adult_marked_by_user, m.adult_marked_by_ai, m.moderation_status, m.dominant_color, m.source_url,
-           m.youtube_video_id,
+           m.youtube_video_id, m.custom_thumb_path,
            m.deleted_at, m.publish_at,
            c.name AS category_name, c.slug AS category_slug,
            sc.name AS subcategory_name, sc.slug AS subcategory_slug,
@@ -4006,6 +4012,10 @@ local function finalize_upload(req, user, source, original_filename, form, on_st
   if not row then return 500, { detail = "Could not save media: " .. tostring(insert_err) } end
   local media_id = db.toint(row.id, row.id)
   write_media_subcategories(media_id, resolved_subcategory_ids)
+  if nn(form.thumbnail_token) then
+    local tok, terr = pcall(M._attach_staged_thumbnail, user.id, media_id, form.thumbnail_token, media_kind == "video")
+    if not tok then print("[nyxframe] custom thumbnail attach failed (media " .. tostring(media_id) .. "): " .. tostring(terr)) end
+  end
 
   stage("finishing", media_id)
   local item = fetch_media_by_id(media_id, tostring(user.id))
@@ -4245,7 +4255,7 @@ function upload_chunk_storage.prune()
     handle:close()
   end
   os.execute(string.format(
-    "nice -n 10 find %s -maxdepth 1 -type f \\( -name '_upload_direct_*.part' -o -name 'faststart_*' -o -name '*.tmp.*' \\) -mmin +1440 -delete 2>/dev/null;"
+    "nice -n 10 find %s -maxdepth 1 -type f \\( -name '_upload_direct_*.part' -o -name 'faststart_*' -o -name '*.tmp.*' -o -name '_thumb_stage_*' \\) -mmin +1440 -delete 2>/dev/null;"
       .. " find %s -maxdepth 1 -type f \\( -name '_upload_jobs_*.json' -o -name '_upload_sessions_*.json' \\) -mmin +1440 -delete 2>/dev/null",
     dir, dir))
 end
@@ -9066,7 +9076,7 @@ function M._fetch_media_for_bytes(media_id)
   return db.fetchone([[
     SELECT m.id, m.user_id, m.media_kind, m.mime_type, m.original_filename, m.storage_path,
            m.file_size, m.created_at, m.updated_at, m.visibility, m.is_adult,
-           m.youtube_video_id, m.deleted_at, m.expires_at, m.content_sha256
+           m.youtube_video_id, m.deleted_at, m.expires_at, m.content_sha256, m.custom_thumb_path
     FROM media_items m
     JOIN users u ON u.id = m.user_id
     WHERE m.id = %s
@@ -9173,6 +9183,11 @@ end
 -- exactly as it already was before this existed).
 prewarm_video_thumb = function(media_id, item)
   local ok, err = pcall(function()
+    -- A custom thumbnail is rendered on first request (serve_media_thumb);
+    -- a frame grab cached here would hide it. Checked in the DB because
+    -- the backfill sweep's rows don't carry the column.
+    local ct = db.fetchone("SELECT custom_thumb_path FROM media_items WHERE id=%s", tostring(media_id))
+    if ct and nn(ct.custom_thumb_path) then return end
     local width = 520
     local shard = string.format("%02x", media_id % 256)
     local cache_path = M.settings.uploads_dir .. "/_thumb_cache/" .. shard .. "/" .. media_id .. "_" .. width .. ".webp"
@@ -9386,6 +9401,15 @@ function M.serve_media_thumb(req)
   -- claim_thumb_job's marker and acquire_transcode_slot's cap with every
   -- other backgrounded thumbnail job for the same reason those already do:
   -- one proven concurrency ceiling, not a new one per feature.
+  -- An uploader-chosen thumbnail beats both the YouTube source thumbnail
+  -- and a frame grab.
+  if media_kind == "video" and nn(item.custom_thumb_path) then
+    local rendered = M._render_custom_thumb(item, width, cache_path)
+    if rendered then
+      return 200, rendered, { ["Content-Type"] = "image/webp", ["Cache-Control"] = M._image_cache_control(item) }
+    end
+  end
+
   if item.youtube_video_id and item.youtube_video_id ~= cjson.null and nn(item.youtube_video_id) then
     local marker = cache_path .. ".pending"
     local cache_dir = cache_path:match("^(.*)/[^/]+$")
@@ -12925,5 +12949,212 @@ M._video_extras_api = {
   digest_seed = media_content_digest_seed,
   settings = function() return M.settings end,
 }
+
+
+-- ---------------------------------------------------------------------------
+-- Custom video thumbnails (2026-10-26). An uploader can pick any image (from
+-- their computer, or their phone's gallery/camera) as a video's thumbnail,
+-- either while uploading or later from the post's edit panel. Stored as the
+-- original image under custom_thumbs/<shard>/<id>_<sha16>.<ext> (fast-disk
+-- tier when configured), recorded in media_items.custom_thumb_path, and
+-- rendered by serve_media_thumb into the usual WEBP thumb cache instead of a
+-- frame grab. Setting/clearing one bumps updated_at, so every thumb URL
+-- (?v=updated_at) changes and Cloudflare/browser caches pick it up at once.
+-- (Hung off M -- this file is at LuaJIT's 200-local ceiling.)
+-- ---------------------------------------------------------------------------
+
+M._CUSTOM_THUMB_MAX_BYTES = 15 * 1024 * 1024
+M._CUSTOM_THUMB_EXT = { ["image/jpeg"] = ".jpg", ["image/png"] = ".png", ["image/webp"] = ".webp", ["image/gif"] = ".gif" }
+
+-- Returns the file extension for an acceptable thumbnail image, or nil + a
+-- message for the client.
+function M._custom_thumb_ext(content)
+  if not content or content == "" then return nil, "Choose an image for the thumbnail." end
+  if #content > M._CUSTOM_THUMB_MAX_BYTES then return nil, "Thumbnail images must be 15MB or smaller." end
+  local mime, kind = sniff_magic(content:sub(1, 512))
+  local ext = kind == "image" and M._CUSTOM_THUMB_EXT[mime]
+  if not ext then return nil, "Thumbnails must be a JPEG, PNG, WEBP or GIF image." end
+  return ext
+end
+
+function M._custom_thumb_cache_glob(media_id)
+  local base = M.settings.uploads_dir .. "/_thumb_cache/"
+  local shard = string.format("%02x", media_id % 256)
+  return base .. shard .. "/" .. media_id .. "_*", base .. media_id .. "_*"
+end
+
+-- Stores `content` as media_id's thumbnail (or clears it when content is
+-- nil), removes the previous image and every cached size, and bumps
+-- updated_at.
+function M._set_custom_thumb(media_id, content, ext)
+  local rel = nil
+  if content then
+    local sha16 = sodium.sodium_bin2hex(sodium.crypto_hash_sha256(content)):sub(1, 16)
+    local shard = string.format("%02x", media_id % 256)
+    rel = "custom_thumbs/" .. shard .. "/" .. media_id .. "_" .. sha16 .. ext
+    local root = media_files.hot_root or M.settings.uploads_dir
+    local full = root .. "/" .. rel
+    os.execute("mkdir -p " .. shell_quote(full:match("^(.*)/[^/]+$")))
+    local tmp = full .. ".tmp." .. tostring(math.random(100000, 999999))
+    local f, ferr = io.open(tmp, "wb")
+    if not f then return nil, "Could not save thumbnail: " .. tostring(ferr) end
+    f:write(content)
+    f:close()
+    os.rename(tmp, full)
+  end
+  local old = db.fetchone("SELECT custom_thumb_path FROM media_items WHERE id=%s", tostring(media_id))
+  local old_rel = old and nn(old.custom_thumb_path)
+  local ok, err = db.execute("UPDATE media_items SET custom_thumb_path=%s, updated_at=now() WHERE id=%s", rel, tostring(media_id))
+  if not ok then return nil, "Could not save thumbnail: " .. tostring(err) end
+  if old_rel and old_rel ~= rel then
+    for _, root in ipairs({ M.settings.uploads_dir, media_files.hot_root }) do
+      if root then os.remove(root .. "/" .. old_rel) end
+    end
+  end
+  local a, b = M._custom_thumb_cache_glob(media_id)
+  os.execute("rm -f " .. a .. " " .. b) -- globs on purpose; media_id is a number
+  return true
+end
+
+-- Renders (and caches) a custom thumbnail at `width`; nil if it can't.
+function M._render_custom_thumb(item, width, cache_path)
+  local src = media_files.legacy_upload_path(M.settings.uploads_dir, nn(item.custom_thumb_path))
+  if not src then return nil end
+  local bytes = media_files.render_webp_bytes_from_path(src, width, 86)
+  if not bytes then return nil end
+  os.execute("mkdir -p " .. shell_quote(cache_path:match("^(.*)/[^/]+$")))
+  local tmp = cache_path .. ".tmp." .. tostring(math.random(100000, 999999))
+  local f = io.open(tmp, "wb")
+  if f then
+    f:write(bytes)
+    f:close()
+    os.rename(tmp, cache_path)
+  end
+  return bytes
+end
+
+function M._load_owned_video(req)
+  local user, _, status, body = current_user(req)
+  if not user then return nil, nil, status, body end
+  local media_id = tonumber(req.params.media_id)
+  local row = media_id and db.fetchone("SELECT id, user_id, media_kind, deleted_at FROM media_items WHERE id=%s", tostring(media_id))
+  if not row or nn(row.deleted_at) then return nil, nil, 404, { detail = "Media not found." } end
+  if tostring(row.user_id) ~= tostring(user.id) then return nil, nil, 403, { detail = "Only the uploader can change this post's thumbnail." } end
+  if row.media_kind ~= "video" then return nil, nil, 400, { detail = "Custom thumbnails are for videos." } end
+  return user, media_id
+end
+
+function M._media_response(req, user, media_id)
+  local item = fetch_media_by_id(media_id, tostring(user.id))
+  return 200, { media = decode_media_row(item, viewer_adult_allowed(tostring(user.id)), req) }
+end
+
+-- POST /api/media/:media_id/thumbnail (multipart "file")
+function M.set_media_thumbnail(req)
+  local user, media_id, status, body = M._load_owned_video(req)
+  if not user then return status, body end
+  local upload = (req.files or {}).file
+  local ext, err = M._custom_thumb_ext(upload and upload.content)
+  if not ext then return 400, { detail = err } end
+  local ok, serr = M._set_custom_thumb(media_id, upload.content, ext)
+  if not ok then return 500, { detail = serr } end
+  return M._media_response(req, user, media_id)
+end
+
+-- DELETE /api/media/:media_id/thumbnail -- back to the automatic one.
+function M.clear_media_thumbnail(req)
+  local user, media_id, status, body = M._load_owned_video(req)
+  if not user then return status, body end
+  local ok, serr = M._set_custom_thumb(media_id, nil)
+  if not ok then return 500, { detail = serr } end
+  return M._media_response(req, user, media_id)
+end
+
+-- POST /api/media/upload/thumbnail (multipart "file") -> { thumbnail_token }.
+-- The upload page sends the chosen image ahead of the video and passes the
+-- token with the upload; finalize_upload attaches it once the post exists,
+-- so it applies even if the uploader has left the page by then.
+function M.stage_upload_thumbnail(req)
+  local user, _, status, body = current_user(req)
+  if not user then return status, body end
+  local upload = (req.files or {}).file
+  local ext, err = M._custom_thumb_ext(upload and upload.content)
+  if not ext then return 400, { detail = err } end
+  local token = sodium.sodium_bin2hex(sodium.randombytes_buf(16))
+  local path = upload_chunk_storage.dir() .. "/_thumb_stage_" .. tostring(user.id) .. "_" .. token .. ext
+  local f, ferr = io.open(path, "wb")
+  if not f then return 500, { detail = "Could not stage thumbnail: " .. tostring(ferr) } end
+  f:write(upload.content)
+  f:close()
+  return 200, { thumbnail_token = token }
+end
+
+-- Attaches (video) or discards (anything else) a staged thumbnail.
+function M._attach_staged_thumbnail(user_id, media_id, token, is_video)
+  if not tostring(token):match("^%x+$") then return end
+  for _, ext in pairs(M._CUSTOM_THUMB_EXT) do
+    local path = upload_chunk_storage.dir() .. "/_thumb_stage_" .. tostring(user_id) .. "_" .. token .. ext
+    local f = io.open(path, "rb")
+    if f then
+      local content = f:read("*a")
+      f:close()
+      os.remove(path)
+      if is_video and M._custom_thumb_ext(content) then M._set_custom_thumb(media_id, content, ext) end
+      return
+    end
+  end
+end
+
+-- GET /api/me/media/picker?q=&offset=&limit= -- the uploader's own posts
+-- that have tags, newest first, for the "reuse tags from a post" picker.
+-- Deliberately light (no like/comment counts, no subcategory joins): the
+-- picker pages through thousands of posts. q matches title or any tag; a
+-- bare post id or a pasted .../media/123 URL finds that post directly.
+function M.my_media_picker(req)
+  local user, _, status, body = current_user(req)
+  if not user then return status, body end
+  local q = trim(nn(req.query.q) or ""):sub(1, 120)
+  local limit = math.max(1, math.min(tonumber(req.query.limit) or 36, 60))
+  local offset = math.max(0, math.min(tonumber(req.query.offset) or 0, 100000))
+  local direct_id = q:match("^#?(%d+)$") or q:match("/media/(%d+)")
+  local where = { "m.user_id=%s", "m.deleted_at IS NULL", "jsonb_array_length(COALESCE(m.tags::jsonb, '[]'::jsonb)) > 0" }
+  local params = { tostring(user.id) }
+  if direct_id then
+    where[#where + 1] = "m.id=%s"
+    params[#params + 1] = direct_id
+  elseif q ~= "" then
+    local like = "%" .. q:gsub("([%%_\\])", "\\%1") .. "%"
+    where[#where + 1] = "(m.title ILIKE %s OR m.tags::text ILIKE %s)"
+    params[#params + 1] = like
+    params[#params + 1] = like
+  end
+  params[#params + 1] = tostring(limit + 1)
+  params[#params + 1] = tostring(offset)
+  local rows, err = db.fetchall([[
+    SELECT m.id, m.user_id, m.title, m.tags, m.media_kind, m.mime_type, m.original_filename,
+           m.updated_at, m.created_at, m.visibility, m.is_adult, c.name AS category_name
+    FROM media_items m
+    JOIN categories c ON c.id = m.category_id
+    WHERE ]] .. table.concat(where, " AND ") .. [[
+    ORDER BY m.created_at DESC, m.id DESC
+    LIMIT %s OFFSET %s
+  ]], unpack(params))
+  if err then return 500, { detail = "Query failed: " .. tostring(err) } end
+  local adult_allowed = viewer_adult_allowed(tostring(user.id))
+  local items = {}
+  for i, row in ipairs(rows or {}) do
+    if i > limit then break end
+    row.id = db.toint(row.id, row.id)
+    row.is_adult = db.tobool(row.is_adult)
+    local ok, tags = pcall(cjson.decode, row.tags or "[]")
+    with_urls(req, row, adult_allowed)
+    items[#items + 1] = {
+      id = row.id, title = row.title, media_kind = row.media_kind, category_name = row.category_name,
+      created_at = row.created_at, visibility = row.visibility,
+      tags = arr(ok and type(tags) == "table" and tags or {}), thumb_url = row.thumb_url or cjson.null,
+    }
+  end
+  return 200, { items = arr(items), has_more = #(rows or {}) > limit }
+end
 
 return M

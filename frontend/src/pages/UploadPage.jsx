@@ -5,6 +5,8 @@ import { apiFetch, clearApiCache, postClientDiagnostic, readToken, resolveApiUrl
 import { MAX_UPLOAD_BYTES } from "../config.js";
 import { addPendingUploadJob, describeUploadStage } from "../uploadJobs.js";
 import { ChipRow, Page, RequireLogin, Segmented } from "../components/ui.jsx";
+import { ReuseTagsField, mergeTags } from "../components/PostPicker.jsx";
+import { ThumbnailChooser, stageThumbnail } from "../components/ThumbnailPicker.jsx";
 import { formatBytes } from "../utils/format.js";
 
 const SUBCATEGORY_SLOT_COUNT = 20;
@@ -237,7 +239,11 @@ export function UploadPage({ ctx }) {
   // all getting the one typed-in title would be wrong, not a convenience).
   const [extraFiles, setExtraFiles] = useState([]); // [{ id, file, status: pending|uploading|done|error, error }]
   const extraFileIdRef = useRef(0);
-  const prefillRef = useRef(null); // uncontrolled -- "Prefill from post" input, read on click only
+  // Custom thumbnail for the primary file when it's a video (a Blob, or
+  // null for the automatic frame grab), plus the preview <video> so "Use
+  // current frame" can capture whatever frame it's paused on.
+  const [thumbnail, setThumbnail] = useState(null);
+  const previewVideoRef = useRef(null);
   // idle -> uploading (bytes going up) -> processing (server working on a
   // single upload this page is following) -> idle/navigated away.
   const [phase, setPhase] = useState("idle");
@@ -283,6 +289,7 @@ export function UploadPage({ ctx }) {
   useEffect(() => {
     setDuplicates([]);
     setAnalysis(null);
+    setThumbnail(null);
   }, [form.file]);
 
   // Paste an image straight from the clipboard (a screenshot, a copied
@@ -380,24 +387,13 @@ export function UploadPage({ ctx }) {
     setForm((current) => ({ ...current, [key]: value }));
   }
 
-  // "Prefill from post" -- lets an uploader reuse tags from one of their
-  // existing posts instead of retyping them. Accepts either a bare post id
-  // or a pasted post URL (…/media/123); GET /api/media/:id is already the
-  // same endpoint MediaDetailPage uses and returns the full media object,
-  // tags included, for anything the viewer is allowed to see.
-  async function prefillTagsFromPost() {
-    const idMatch = prefillRef.current?.value.match(/(\d+)\s*$/);
-    const mediaId = idMatch && idMatch[1];
-    if (!mediaId) return ctx.showToast("Enter a post id or paste a post URL.", "error");
-    try {
-      const data = await apiFetch(`/api/media/${mediaId}`);
-      const tags = Array.isArray(data.tags) ? data.tags : [];
-      if (!tags.length) return ctx.showToast(`"${data.title || `Post #${mediaId}`}" has no tags to copy.`, "info");
-      update("tags", tags.join(", "));
-      ctx.showToast(`Copied ${tags.length} tag${tags.length === 1 ? "" : "s"} from "${data.title || `Post #${mediaId}`}".`, "success");
-    } catch (error) {
-      ctx.showToast(error.message || "Could not load that post.", "error");
-    }
+  // Tags picked from one of the uploader's own posts (PostPicker).
+  function applyPickedTags(tags, post, mode) {
+    const { tags: next, added } = mergeTags(parseTags(form.tags), tags, mode);
+    update("tags", next.join(", "));
+    const from = `"${post.title || `Post #${post.id}`}"`;
+    if (mode === "replace") ctx.showToast(`Tags replaced with ${next.length} from ${from}.`, "success");
+    else ctx.showToast(added ? `Added ${added} tag${added === 1 ? "" : "s"} from ${from}.` : `You already have every tag from ${from}.`, added ? "success" : "info");
   }
 
   function updateSubcategory(index, value) {
@@ -466,7 +462,7 @@ export function UploadPage({ ctx }) {
 
   // Form fields shared by every file of this submit (title/description
   // are per file: the batch rows leave them blank for AI auto-fill).
-  function uploadFields({ title, description }) {
+  function uploadFields({ title, description, thumbnailToken }) {
     const placement = resolvePlacement(ctx.lookups.categories, form.category, form.subcategories);
     const fields = [
       ["title", title],
@@ -489,6 +485,7 @@ export function UploadPage({ ctx }) {
     if (form.source_url.trim()) fields.push(["source_url", form.source_url.trim()]);
     if (form.publish_at) fields.push(["publish_at", new Date(form.publish_at).toISOString()]);
     if (form.expires_in_hours) fields.push(["expires_in_hours", form.expires_in_hours]);
+    if (thumbnailToken) fields.push(["thumbnail_token", thumbnailToken]);
     return fields;
   }
 
@@ -497,7 +494,7 @@ export function UploadPage({ ctx }) {
   // continues server-side), or a finished { media } from an older server.
   // `onBytes(sent)` reports progress in bytes. Throws on failure; an error
   // with status -1 means the user cancelled.
-  async function uploadOneFile(file, { title, description }, onBytes) {
+  async function uploadOneFile(file, { title, description, thumbnailToken }, onBytes) {
     const uploadT0 = performance.now();
     let uploadMethod = "direct";
     let chunkCount = 0;
@@ -514,7 +511,7 @@ export function UploadPage({ ctx }) {
       error_message: errorMessage,
     });
     try {
-      const fields = uploadFields({ title, description });
+      const fields = uploadFields({ title, description, thumbnailToken });
       let data;
       if (file.size <= SINGLE_REQUEST_MAX_BYTES) {
         const url = await resolveApiUrl("/api/media");
@@ -739,6 +736,11 @@ export function UploadPage({ ctx }) {
     setRate(null);
     setStage("");
     try {
+      // A chosen thumbnail goes up first (it's small); the upload carries
+      // its token and the server attaches it once the post exists.
+      if (thumbnail && form.file.type.startsWith("video/")) {
+        entries[0].thumbnailToken = await stageThumbnail(thumbnail);
+      }
       if (entries.length === 1) {
         const data = await uploadOneFile(form.file, entries[0], (bytes) => onFileBytes("primary", bytes));
         setRate(null);
@@ -872,6 +874,7 @@ export function UploadPage({ ctx }) {
               <div className="upload-preview">
                 {!preview ? null : isVideo ? (
                   <video
+                    ref={previewVideoRef}
                     src={preview}
                     controls
                     muted
@@ -907,6 +910,16 @@ export function UploadPage({ ctx }) {
               </div>
             </div>
           )}
+
+          {form.file && isVideo ? (
+            <ThumbnailChooser
+              value={thumbnail}
+              onChange={setThumbnail}
+              videoRef={previewVideoRef}
+              disabled={uploading}
+              onError={(message) => ctx.showToast(message, "error")}
+            />
+          ) : null}
 
           {form.file ? (
             <div className="upload-batch-queue">
@@ -1001,15 +1014,7 @@ export function UploadPage({ ctx }) {
               <small className="field-hint">Separate tags with commas.</small>
             </label>
             {tagList.length ? <ChipRow values={tagList.map((tag) => `#${tag}`)} /> : null}
-            <div className="field upload-prefill-tags">
-              <span className="field-head">Reuse tags from another post</span>
-              <div className="upload-prefill-tags-row">
-                <input ref={prefillRef} type="text" placeholder="Post id or URL" aria-label="Post id or URL to copy tags from" />
-                <button type="button" onClick={prefillTagsFromPost}>
-                  <Clipboard size={15} />Prefill from post
-                </button>
-              </div>
-            </div>
+            <ReuseTagsField currentTags={tagList} onApply={applyPickedTags} />
           </section>
 
           <section className="upload-section">

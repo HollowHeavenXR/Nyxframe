@@ -7,6 +7,8 @@ import { formatBytes, formatDate, numberish } from "../utils/format.js";
 import { CARD_IMAGE_WIDTH, CARD_VIDEO_THUMB_WIDTH, isGifMedia, isPerfLiteRuntime, mediaImageSources, thumbUrl, videoPreviewUrl } from "../utils/media.js";
 import { observeViewport } from "../utils/viewport.js";
 import { Avatar, EmptyState, ResilientImage, SkeletonGrid, StatsRow } from "./ui.jsx";
+import { ReuseTagsField, mergeTags } from "./PostPicker.jsx";
+import { EditThumbnailPanel } from "./ThumbnailPicker.jsx";
 
 function subcategoryNames(item) {
   if (Array.isArray(item?.subcategory_names) && item.subcategory_names.length) return item.subcategory_names;
@@ -311,9 +313,13 @@ function draftFromMedia(media) {
 export function MediaEditor({ ctx, media, onChanged }) {
   const [draft, setDraft] = useState(() => draftFromMedia(media));
   const [busy, setBusy] = useState(false);
-  const prefillRef = useRef(null); // uncontrolled -- "Prefill from post" input, read on click only
-
-  useEffect(() => { setDraft(draftFromMedia(media)); }, [media]);
+  // A thumbnail change hands back a fresh media object; that must not wipe
+  // unsaved edits in the rest of the form.
+  const keepDraftRef = useRef(false);
+  useEffect(() => {
+    if (keepDraftRef.current) { keepDraftRef.current = false; return; }
+    setDraft(draftFromMedia(media));
+  }, [media]);
 
   const categories = ctx.lookups?.categories || [];
   const selectedCategory = categories.find((row) => String(row.id) === String(draft.category_id));
@@ -321,23 +327,15 @@ export function MediaEditor({ ctx, media, onChanged }) {
 
   function set(key, value) { setDraft((current) => ({ ...current, [key]: value })); }
 
-  // Same "Prefill from post" capability as UploadPage.jsx's upload form --
-  // see its header comment. Duplicated rather than shared as a hook since
-  // the two forms use different state shapes (draft/set here vs form/update
-  // there) for a handful of lines of logic.
-  async function prefillTagsFromPost() {
-    const idMatch = prefillRef.current?.value.match(/(\d+)\s*$/);
-    const mediaId = idMatch && idMatch[1];
-    if (!mediaId) return ctx.showToast("Enter a post id or paste a post URL.", "error");
-    try {
-      const data = await apiFetch(`/api/media/${mediaId}`);
-      const tags = Array.isArray(data.tags) ? data.tags : [];
-      if (!tags.length) return ctx.showToast(`"${data.title || `Post #${mediaId}`}" has no tags to copy.`, "info");
-      set("tags", tags.join(", "));
-      ctx.showToast(`Copied ${tags.length} tag${tags.length === 1 ? "" : "s"} from "${data.title || `Post #${mediaId}`}".`, "success");
-    } catch (error) {
-      ctx.showToast(error.message || "Could not load that post.", "error");
-    }
+  const draftTags = draft.tags.split(",").map((tag) => tag.trim()).filter(Boolean);
+
+  // Tags picked from another of the uploader's posts (PostPicker).
+  function applyPickedTags(tags, post, mode) {
+    const { tags: next, added } = mergeTags(draftTags, tags, mode);
+    set("tags", next.join(", "));
+    const from = `"${post.title || `Post #${post.id}`}"`;
+    if (mode === "replace") ctx.showToast(`Tags replaced with ${next.length} from ${from}. Save to keep them.`, "success");
+    else ctx.showToast(added ? `Added ${added} tag${added === 1 ? "" : "s"} from ${from}. Save to keep them.` : `You already have every tag from ${from}.`, added ? "success" : "info");
   }
 
   function setSlot(kind, index, value) {
@@ -390,13 +388,8 @@ export function MediaEditor({ ctx, media, onChanged }) {
       <label className="field"><span>Title</span><input value={draft.title} onChange={(event) => set("title", event.target.value)} maxLength={160} /></label>
       <label className="field"><span>Description</span><textarea value={draft.description} onChange={(event) => set("description", event.target.value)} rows={4} maxLength={2000} /></label>
       <label className="field"><span>Tags</span><input value={draft.tags} onChange={(event) => set("tags", event.target.value)} placeholder="comma separated" /></label>
-      <div className="field upload-prefill-tags">
-        <span className="field-head">Reuse tags from another post</span>
-        <div className="upload-prefill-tags-row">
-          <input ref={prefillRef} type="text" placeholder="Post id or URL" aria-label="Post id or URL to copy tags from" />
-          <button type="button" onClick={prefillTagsFromPost}><Copy size={15} />Prefill from post</button>
-        </div>
-      </div>
+      <ReuseTagsField currentTags={draftTags} onApply={applyPickedTags} />
+      <EditThumbnailPanel ctx={ctx} media={media} onChanged={(next) => { keepDraftRef.current = true; onChanged(next); }} />
       <label className="field"><span>Original source</span><input value={draft.source_url} onChange={(event) => set("source_url", event.target.value)} type="url" inputMode="url" maxLength={500} placeholder="https://… where this came from" /></label>
       <label className="field"><span>Category</span>
         <select value={draft.category_id} onChange={(event) => setDraft((current) => ({ ...current, category_id: event.target.value, subcategory_ids: slots([]) }))}>
