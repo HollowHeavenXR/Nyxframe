@@ -26,3 +26,6 @@ index.html.backup-*
 404.html.backup-*
 .claude/settings.local.json
 result
+
+# local backups
+backups/
